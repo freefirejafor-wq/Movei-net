@@ -5,7 +5,7 @@ RUN apk add --no-cache ffmpeg
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --include=dev
+RUN npm install --legacy-peer-deps --include=dev
 
 COPY . .
 RUN npm run build

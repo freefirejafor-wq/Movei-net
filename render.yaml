@@ -3,8 +3,8 @@ services:
     name: cinepulse-hd
     runtime: node
     plan: free
-    buildCommand: npm install --include=dev && npm run build
-    startCommand: npm run start:render
+    buildCommand: npm install --legacy-peer-deps --include=dev && npm run build
+    startCommand: npx tsx server.ts
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV

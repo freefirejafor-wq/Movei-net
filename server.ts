@@ -65,7 +65,64 @@ interface CacheEntry<T> {
 
 const catalogCache = new Map<string, CacheEntry<{ items: MovieCardItem[]; maxPage: number; activeNodeId: string }>>();
 const detailCache = new Map<string, CacheEntry<MovieDetailData>>();
+const detailTitleCache = new Map<string, MovieDetailData>();
 let healthCache: CacheEntry<ServerNodeStatus[]> | null = null;
+
+function sortSourcesFastestFirst(sources?: StreamSource[]): StreamSource[] {
+  if (!Array.isArray(sources) || sources.length <= 1) return sources || [];
+  const score = (src: StreamSource) => {
+    const isHevc = /\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${src.name} ${src.qualityLabel}`);
+    const isBestHeavy = /best\s*quality/i.test(src.qualityLabel || '');
+    let s = isHevc ? 200 : 1000;
+    if (isBestHeavy) s -= 250;
+    if (src.type !== 'embed') s += 500;
+    if (src.quality >= 360 && src.quality <= 576) s += 650;
+    else if (src.quality === 720) s += 500;
+    else if (src.quality === 1080) s += 350;
+    else s += 150;
+    return s;
+  };
+  return [...sources].sort((a, b) => score(b) - score(a));
+}
+
+function storeDetailInCaches(itemPath: string, det: MovieDetailData, expiresAt: number): void {
+  if (!det || typeof det !== 'object') return;
+  if (Array.isArray(det.episodes)) {
+    for (const ep of det.episodes) {
+      if (Array.isArray(ep.sources)) {
+        ep.sources = sortSourcesFastestFirst(ep.sources);
+      }
+    }
+  }
+  if (itemPath) {
+    detailCache.set(itemPath, { data: det, expiresAt });
+  }
+  if (det.title && det.episodes?.length) {
+    const canon = getCanonicalTitleKey(det.title);
+    if (canon) detailTitleCache.set(canon, det);
+    const base = extractBaseSeriesTitle(det.title).toLowerCase();
+    if (base) detailTitleCache.set(base, det);
+  }
+}
+
+function findCachedDetailByPathOrTitle(itemPath: string, rawTitle = ''): MovieDetailData | null {
+  const now = Date.now();
+  if (itemPath) {
+    const hit = detailCache.get(itemPath);
+    if (hit && hit.expiresAt > now && hit.data?.episodes?.length) {
+      return hit.data;
+    }
+  }
+  if (rawTitle) {
+    const canon = getCanonicalTitleKey(rawTitle);
+    const byCanon = canon ? detailTitleCache.get(canon) : undefined;
+    if (byCanon && byCanon.episodes?.length) return byCanon;
+    const base = extractBaseSeriesTitle(rawTitle).toLowerCase();
+    const byBase = base ? detailTitleCache.get(base) : undefined;
+    if (byBase && byBase.episodes?.length) return byBase;
+  }
+  return null;
+}
 
 const movieRequestsStore: UserMovieRequest[] = [
   {
@@ -1119,16 +1176,13 @@ async function startServer() {
         if (parsed?.details) {
           for (const [itemPath, det] of Object.entries(parsed.details)) {
             if (det && typeof det === 'object') {
-              detailCache.set(itemPath, {
-                data: det as MovieDetailData,
-                expiresAt: detailTtl,
-              });
+              storeDetailInCaches(itemPath, det as MovieDetailData, detailTtl);
             }
           }
         }
       }
 
-      // Also preload all 16 pre-decrypted shard-*.json files into detailCache
+      // Also preload all 16 pre-decrypted shard-*.json files into detailCache & detailTitleCache
       const shardsDir = path.join(__dirname, 'public', 'db-shards');
       if (fs.existsSync(shardsDir)) {
         for (let i = 0; i < 16; i++) {
@@ -1145,10 +1199,7 @@ async function startServer() {
             if (detailsMap && typeof detailsMap === 'object') {
               for (const [itemPath, det] of Object.entries(detailsMap)) {
                 if (det && typeof det === 'object' && typeof (det as any).title === 'string') {
-                  detailCache.set(itemPath, {
-                    data: det as MovieDetailData,
-                    expiresAt: detailTtl,
-                  });
+                  storeDetailInCaches(itemPath, det as MovieDetailData, detailTtl);
                 }
               }
             }
@@ -1201,22 +1252,30 @@ async function startServer() {
           catalogCache.set(cacheKey, entry);
           catalogCache.set(`${wp}::page=1::q=::node=${activeNodeId}`, entry);
 
-          // Pre-warm top uncached details per category so the first click on new live uploads is 0ms
-          const warmCount = wp === '/' ? 8 : 3;
-          for (const card of mergedItems.slice(0, warmCount)) {
-            if (!card.path || card.path.startsWith('/mf/') || detailCache.has(card.path)) continue;
-            try {
-              const { html, finalOrigin } = await fetchFromMirrors(card.path, activeNodeId);
-              const det = parseMovieDetail(html, card.path, finalOrigin);
-              if (det.episodes.length > 0) {
-                detailCache.set(card.path, {
-                  data: det,
-                  expiresAt: Date.now() + 3600_000,
-                });
-              }
-            } catch {
-              // ignore single detail warmup failure
-            }
+          // Pre-warm top uncached details per category in parallel batches of 4 so the first click on new live uploads is 0ms
+          const warmCount = wp === '/' ? 16 : 4;
+          const candidates = mergedItems
+            .slice(0, warmCount)
+            .filter(
+              (card) =>
+                card.path &&
+                !card.path.startsWith('/mf/') &&
+                !findCachedDetailByPathOrTitle(card.path, card.title)
+            );
+          for (let i = 0; i < candidates.length; i += 4) {
+            await Promise.allSettled(
+              candidates.slice(i, i + 4).map(async (card) => {
+                try {
+                  const { html, finalOrigin } = await fetchFromMirrors(card.path, activeNodeId);
+                  const det = parseMovieDetail(html, card.path, finalOrigin);
+                  if (det.episodes.length > 0) {
+                    storeDetailInCaches(card.path, det, Date.now() + 3600_000);
+                  }
+                } catch {
+                  // ignore single detail warmup failure
+                }
+              })
+            );
           }
         }
       } catch {
@@ -1224,7 +1283,7 @@ async function startServer() {
       }
     }
   };
-  setTimeout(syncLiveCategories, 1500).unref();
+  setTimeout(syncLiveCategories, 400).unref();
   setInterval(syncLiveCategories, 180_000).unref();
 
   // 1. Categories & Anonymized Server Nodes Endpoint
@@ -1357,9 +1416,48 @@ async function startServer() {
       targetPath = `${base}/page/${page}`;
     }
 
+    const collectPrefetchedDetails = (list: MovieCardItem[], warmNodeId: string) => {
+      const prefetchedDetails: Record<string, MovieDetailData> = {};
+      const missingCards: MovieCardItem[] = [];
+      for (const item of list.slice(0, 24)) {
+        if (!item?.path) continue;
+        const hit = findCachedDetailByPathOrTitle(item.path, item.title);
+        if (hit && hit.episodes?.length) {
+          prefetchedDetails[item.path] = hit;
+          if (!detailCache.has(item.path)) {
+            detailCache.set(item.path, { data: hit, expiresAt: Date.now() + 3600_000 });
+          }
+        } else if (!item.path.startsWith('/mf/')) {
+          missingCards.push(item);
+        }
+      }
+      if (missingCards.length > 0) {
+        void (async () => {
+          for (let i = 0; i < Math.min(missingCards.length, 10); i += 3) {
+            await Promise.allSettled(
+              missingCards.slice(i, i + 3).map(async (card) => {
+                if (findCachedDetailByPathOrTitle(card.path, card.title)) return;
+                try {
+                  const { html, finalOrigin } = await fetchFromMirrors(card.path, warmNodeId);
+                  const det = parseMovieDetail(html, card.path, finalOrigin);
+                  if (det.episodes.length > 0) {
+                    storeDetailInCaches(card.path, det, Date.now() + 3600_000);
+                  }
+                } catch {
+                  // ignore
+                }
+              })
+            );
+          }
+        })();
+      }
+      return prefetchedDetails;
+    };
+
     const cacheKey = `${rawPath}::page=${page}::q=${search}::node=${nodeId || 'auto'}`;
     const cached = catalogCache.get(cacheKey);
     if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
+      const normalized = normalizeMovieCardList(cached.data.items);
       res.json({
         ok: true,
         cached: true,
@@ -1367,7 +1465,8 @@ async function startServer() {
         page,
         maxPage: cached.data.maxPage,
         activeNodeId: cached.data.activeNodeId,
-        items: normalizeMovieCardList(cached.data.items),
+        items: normalized,
+        prefetchedDetails: collectPrefetchedDetails(normalized, cached.data.activeNodeId),
       });
       return;
     }
@@ -1449,6 +1548,7 @@ async function startServer() {
           maxPage,
           activeNodeId,
           items,
+          prefetchedDetails: collectPrefetchedDetails(items, activeNodeId),
         });
         return;
       }
@@ -1517,31 +1617,14 @@ async function startServer() {
         )
       );
 
-    // 1. Instant 0ms check by path
-    const cached = detailCache.get(rawPath);
-    if (cached && cached.expiresAt > Date.now()) {
-      res.json({ ok: true, cached: true, detail: attachFastRelatedSeasons(cached.data) });
-      return;
-    }
-
-    // 2. Instant 0ms check by matching title in detailCache (including /mf/ cards that match a cached movie!)
-    if (fallbackTitle && !isEnrich) {
-      const cleanWant = extractBaseSeriesTitle(fallbackTitle).toLowerCase();
-      for (const entry of detailCache.values()) {
-        const d = entry.data;
-        const dClean = extractBaseSeriesTitle(d.title).toLowerCase();
-        if (
-          d.episodes?.length &&
-          (d.title === fallbackTitle || (cleanWant.length >= 4 && dClean === cleanWant))
-        ) {
-          detailCache.set(rawPath, {
-            data: d,
-            expiresAt: Date.now() + 3600_000,
-          });
-          res.json({ ok: true, cached: true, detail: attachFastRelatedSeasons(d) });
-          return;
-        }
+    // 1. Instant 0ms O(1) check by path OR canonical title (including /mf/ cards and fresh /movie/mKs_ slugs!)
+    const instantHit = findCachedDetailByPathOrTitle(rawPath, !isEnrich ? fallbackTitle : '');
+    if (instantHit) {
+      if (rawPath && !detailCache.has(rawPath)) {
+        detailCache.set(rawPath, { data: instantHit, expiresAt: Date.now() + 3600_000 });
       }
+      res.json({ ok: true, cached: true, detail: attachFastRelatedSeasons(instantHit) });
+      return;
     }
 
     // 3. Dedicated MyFlixBD `/mf/...` Detail & Stream Extractor (Prefer direct ad-free primary streams first!)

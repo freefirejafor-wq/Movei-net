@@ -2,6 +2,7 @@ import { ALL_CATEGORIES, INITIAL_FALLBACK_MOVIES } from '../data/categories';
 import {
   cleanTimeAgoAndEpisode,
   deduplicateMovieCards,
+  getCanonicalTitleKey,
   getItemMinutesAgo,
   normalizeMovieCardItem,
   normalizeMovieCardList,
@@ -49,6 +50,20 @@ export function setVideoStartupPriority(active: boolean): void {
 }
 
 function normalizeLookupTitleKey(rawTitle: string): string {
+  const canon = getCanonicalTitleKey(rawTitle || '');
+  if (canon) return canon;
+  return (rawTitle || '')
+    .replace(/\[.*?\]|\(.*?\)/g, ' ')
+    .replace(
+      /\b(?:S\d+|Season\s*\d+(?:-\d+)?|Ep(?:isode)?\s*\d+(?:-\d+)?|Complete(?:d)?|Added|Full\s*HD|ORG|Hindi|Bangla|Bengali|Dual|Multi|Audio|The\s*Movie)\b/gi,
+      ' '
+    )
+    .toLowerCase()
+    .replace(/[^a-z0-9\u0980-\u09ff]+/g, '')
+    .trim();
+}
+
+function legacyNormalizeLookupTitleKey(rawTitle: string): string {
   return (rawTitle || '')
     .replace(/\[.*?\]|\(.*?\)/g, ' ')
     .replace(
@@ -73,6 +88,23 @@ function computeShardHex(str: string): string {
   return (h & 0x0f).toString(16);
 }
 
+function sortEpisodeSourcesFastestFirst(sources?: StreamSource[]): StreamSource[] {
+  if (!Array.isArray(sources) || sources.length <= 1) return sources || [];
+  const score = (src: StreamSource) => {
+    const isHevc = /\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${src.name} ${src.qualityLabel}`);
+    const isBestHeavy = /best\s*quality/i.test(src.qualityLabel || '');
+    let s = isHevc ? 200 : 1000;
+    if (isBestHeavy) s -= 250;
+    if (src.type !== 'embed') s += 500;
+    if (src.quality >= 360 && src.quality <= 576) s += 650;
+    else if (src.quality === 720) s += 500;
+    else if (src.quality === 1080) s += 350;
+    else s += 150;
+    return s;
+  };
+  return [...sources].sort((a, b) => score(b) - score(a));
+}
+
 function indexDetailsIntoMemory(detailsMap?: Record<string, MovieDetailData>): void {
   if (!detailsMap) return;
   if (!loadedStaticDb) {
@@ -88,6 +120,7 @@ function indexDetailsIntoMemory(detailsMap?: Record<string, MovieDetailData>): v
             src.downloadUrl = resolveDirectDownloadUrl(src.downloadUrl);
           }
         }
+        ep.sources = sortEpisodeSourcesFastestFirst(ep.sources);
       }
       for (const btn of det.downloadButtons || []) {
         if (btn.url && btn.url.startsWith('/api/go?t=')) {
@@ -97,6 +130,8 @@ function indexDetailsIntoMemory(detailsMap?: Record<string, MovieDetailData>): v
       loadedStaticDb.details[detPath] = det;
       const k1 = normalizeLookupTitleKey(det.title);
       if (k1) staticDbTitleIndex.set(k1, det);
+      const kLegacy = legacyNormalizeLookupTitleKey(det.title);
+      if (kLegacy) staticDbTitleIndex.set(kLegacy, det);
       const k2 = det.title.toLowerCase().replace(/[^a-z0-9]/g, '');
       if (k2) staticDbTitleIndex.set(k2, det);
     }
@@ -126,10 +161,12 @@ async function loadShardByHex(hex: string): Promise<void> {
   return p;
 }
 
-async function loadShardForMovie(rawPath: string, rawTitle: string): Promise<MovieDetailData | null> {
-  const k = normalizeLookupTitleKey(rawTitle);
+export async function loadShardForMovie(rawPath: string, rawTitle: string): Promise<MovieDetailData | null> {
+  const k1 = normalizeLookupTitleKey(rawTitle);
+  const kLegacy = legacyNormalizeLookupTitleKey(rawTitle);
   const hexes = new Set<string>();
-  if (k) hexes.add(computeShardHex(k));
+  if (k1) hexes.add(computeShardHex(k1));
+  if (kLegacy) hexes.add(computeShardHex(kLegacy));
   if (rawPath) hexes.add(computeShardHex(rawPath));
   await Promise.all(Array.from(hexes).map((h) => loadShardByHex(h)));
   return getInstantCachedDetail(rawPath, rawTitle);
@@ -164,17 +201,15 @@ async function loadStaticDb(): Promise<StaticDbSnapshot | null> {
 
 // Kick off static-db.json + local shards preload and CDN preconnect immediately on startup for 0ms first-click playback!
 if (typeof window !== 'undefined') {
-  loadStaticDb().then(() => {
-    ensurePreconnectOrigin('https://fsldownload.com');
-    // Quietly index local static shards in the background so getInstantCachedDetail is 0ms on first click
-    const hexChars = '0123456789abcdef'.split('');
-    hexChars.forEach((hex, idx) => {
-      window.setTimeout(() => {
-        if (!isVideoActivelyStarting) {
-          loadShardByHex(hex).catch(() => {});
-        }
-      }, 150 + idx * 80);
-    });
+  ensurePreconnectOrigin('https://fsldownload.com');
+  // Load all 16 local static shards immediately in parallel so getInstantCachedDetail is 100% ready before the 1st click
+  const hexChars = '0123456789abcdef'.split('');
+  void Promise.allSettled(hexChars.map((hex) => loadShardByHex(hex)));
+  loadStaticDb().then((db) => {
+    const homeItems = db?.catalogs?.['/'] || INITIAL_FALLBACK_MOVIES['/'] || [];
+    if (homeItems.length > 0) {
+      scheduleBackgroundCatalogDetailWarmup(homeItems, 'node-alpha');
+    }
   });
 }
 
@@ -269,6 +304,7 @@ function extractBaseSeriesTitle(rawTitle: string): string {
 const warmedStreamUrls = new Set<string>();
 const preconnectedOrigins = new Set<string>();
 let warmVideoEl: HTMLVideoElement | null = null;
+let hasPrimedHardwareDecoder = false;
 
 function isAppleSafariDevice(): boolean {
   if (typeof window === 'undefined' || typeof navigator === 'undefined') return false;
@@ -292,34 +328,66 @@ function ensurePreconnectOrigin(streamUrl: string): void {
     dnsLink.href = origin;
     document.head.appendChild(dnsLink);
 
-    const link = document.createElement('link');
-    link.rel = 'preconnect';
-    link.href = origin;
-    link.crossOrigin = 'anonymous';
-    document.head.appendChild(link);
+    // 1. Non-CORS preconnect for native <video src="..."> socket pool on Android/Chrome
+    const mediaLink = document.createElement('link');
+    mediaLink.rel = 'preconnect';
+    mediaLink.href = origin;
+    document.head.appendChild(mediaLink);
+
+    // 2. Anonymous CORS preconnect for fetch() / iOS remuxer socket pool
+    const corsLink = document.createElement('link');
+    corsLink.rel = 'preconnect';
+    corsLink.href = origin;
+    corsLink.crossOrigin = 'anonymous';
+    document.head.appendChild(corsLink);
+
+    // Immediately warm the no-cors TLS/HTTP2 socket to the video CDN
+    fetch(origin, { mode: 'no-cors', priority: 'high' as any }).catch(() => {});
   } catch {
     // ignore
   }
 }
 
 /**
- * Warms DNS, TCP, and TLS handshakes to the video CDN origin with zero bandwidth contention
- * so the main <video> element gets 100% of connection slots and starts immediately on the first click.
+ * Warms DNS, TCP, and TLS handshakes to the video CDN origin AND initializes the browser's
+ * hardware video decoder once on page boot so the 1st movie click starts as fast as the 2nd+ click.
  */
 export function warmStreamConnection(streamUrl?: string, primeMediaDecoder = false): void {
   if (!streamUrl || typeof window === 'undefined') return;
   if (!streamUrl.startsWith('http')) return;
   ensurePreconnectOrigin(streamUrl);
-  // Only pre-warm the MKV remuxer header on Apple iOS/Safari devices when NOT actively starting playback,
-  // so Android/Desktop Chrome <video> NEVER competes with background Range fetches on the first click!
-  if (
-    isAppleSafariDevice() &&
-    !isVideoActivelyStarting &&
-    primeMediaDecoder &&
-    !warmedStreamUrls.has(streamUrl)
-  ) {
+  if (!isVideoActivelyStarting && primeMediaDecoder && !warmedStreamUrls.has(streamUrl)) {
     warmedStreamUrls.add(streamUrl);
-    prewarmMkvStreamMeta(streamUrl);
+    if (isAppleSafariDevice()) {
+      prewarmMkvStreamMeta(streamUrl);
+    } else if (!hasPrimedHardwareDecoder && typeof document !== 'undefined') {
+      // One-time background hardware video decoder & <video> media socket warmup on Android/Desktop
+      // before the user clicks their 1st movie! Stops automatically as soon as metadata is ready.
+      hasPrimedHardwareDecoder = true;
+      try {
+        const v = document.createElement('video');
+        v.muted = true;
+        v.playsInline = true;
+        v.preload = 'metadata';
+        v.style.position = 'fixed';
+        v.style.width = '1px';
+        v.style.height = '1px';
+        v.style.opacity = '0';
+        v.style.pointerEvents = 'none';
+        v.style.left = '-9999px';
+        warmVideoEl = v;
+        const cleanupWarm = () => {
+          stopBackgroundWarmVideo();
+        };
+        v.addEventListener('loadedmetadata', cleanupWarm, { once: true });
+        v.addEventListener('error', cleanupWarm, { once: true });
+        v.src = streamUrl;
+        v.load();
+        window.setTimeout(cleanupWarm, 1100);
+      } catch {
+        // ignore
+      }
+    }
   }
 }
 
@@ -329,9 +397,11 @@ export function stopBackgroundWarmVideo(): void {
       warmVideoEl.pause();
       warmVideoEl.removeAttribute('src');
       warmVideoEl.load();
+      warmVideoEl.remove();
     } catch {
       // ignore
     }
+    warmVideoEl = null;
   }
 }
 
@@ -453,13 +523,13 @@ export function prefetchMovieDetails(
 
 function scheduleBackgroundCatalogDetailWarmup(items: MovieCardItem[], nodeId: string): void {
   if (typeof window === 'undefined' || !items?.length) return;
-  // Pre-warm the top 6 visible items in the catalog so the very first click is already in RAM!
-  items.slice(0, 6).forEach((item, idx) => {
+  // Pre-warm the top 12 visible items in the catalog so the very first click is already in RAM!
+  items.slice(0, 12).forEach((item, idx) => {
     window.setTimeout(() => {
       if (!isVideoActivelyStarting && item?.path) {
-        prefetchMovieDetails(item.path, item.title, nodeId, idx < 2);
+        prefetchMovieDetails(item.path, item.title, nodeId, idx < 3);
       }
-    }, 60 + idx * 90);
+    }, 15 + idx * 45);
   });
 }
 
@@ -932,6 +1002,7 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
             : rawPath === '/new-uploads' || rawPath === '/new-releases'
               ? sortItemsByRecentUpload(snap)
               : normalizeMovieCardList(snap);
+        scheduleBackgroundCatalogDetailWarmup(sorted, nodeId);
         return {
           ok: true,
           cached: true,
@@ -941,6 +1012,25 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
           activeNodeId: nodeId,
         };
       }
+    }
+  }
+
+  // Fast-path for /api/details: check in-memory cache and local static shards BEFORE making a network trip!
+  if (pathname === '/api/details' && parsedUrl.searchParams.get('enrich') !== '1') {
+    const rawPath = (parsedUrl.searchParams.get('path') || '').trim();
+    const rawTitle = (parsedUrl.searchParams.get('title') || '').trim();
+    const instant = getInstantCachedDetail(rawPath, rawTitle);
+    if (instant && instant.episodes?.length) {
+      return { ok: true, detail: instant };
+    }
+    const shardHit = await loadShardForMovie(rawPath, rawTitle);
+    if (shardHit && shardHit.episodes?.length) {
+      return { ok: true, detail: shardHit };
+    }
+    const inFlight = rawPath ? inFlightDetailPromises.get(rawPath) : null;
+    if (inFlight) {
+      const resolved = await inFlight;
+      if (resolved?.ok && resolved?.detail) return resolved;
     }
   }
 
@@ -963,9 +1053,21 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
           }
           if (json.detail.url) {
             clientDetailCache.set(json.detail.url, { detail: json.detail, ts: Date.now() });
+            indexDetailsIntoMemory({ [json.detail.url]: json.detail });
           }
           warmDetailFirstStream(json.detail);
         } else if (pathname === '/api/catalog' && Array.isArray(json?.items) && json.items.length > 0) {
+          if (json.prefetchedDetails && typeof json.prefetchedDetails === 'object') {
+            indexDetailsIntoMemory(json.prefetchedDetails);
+            for (const [detPath, detVal] of Object.entries(json.prefetchedDetails)) {
+              if (detVal && (detVal as MovieDetailData).episodes?.length) {
+                clientDetailCache.set(detPath, {
+                  detail: detVal as MovieDetailData,
+                  ts: Date.now(),
+                });
+              }
+            }
+          }
           scheduleBackgroundCatalogDetailWarmup(
             json.items,
             parsedUrl.searchParams.get('node') || 'node-alpha'

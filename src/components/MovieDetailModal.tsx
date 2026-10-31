@@ -52,6 +52,7 @@ import type {
 } from '../types/cinema';
 import {
   getInstantCachedDetail,
+  loadShardForMovie,
   prefetchMovieDetails,
   setVideoStartupPriority,
   stopBackgroundWarmVideo,
@@ -674,6 +675,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     }
 
     const applyResolvedDetail = (resolved: MovieDetailData, isAlreadyMountedInstant = false) => {
+      stopBackgroundWarmVideo();
       const eps: EpisodeItem[] = resolved.episodes || [];
       const initEpIdx =
         savedProgress?.episodeIdx !== undefined && eps[savedProgress.episodeIdx]
@@ -681,10 +683,6 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           : 0;
       const firstEp = eps[initEpIdx];
       const bestSrcIdx = pickBestSourceIndexForNet(firstEp?.sources || [], autoNetQuality);
-      const firstSrc = firstEp?.sources?.[bestSrcIdx] || firstEp?.sources?.[0];
-      if (firstSrc?.url && firstSrc.type !== 'embed') {
-        warmStreamConnection(firstSrc.url);
-      }
       if (!isAlreadyMountedInstant) {
         setDetail(resolved);
         setSelectedEpIdx(initEpIdx);
@@ -692,15 +690,18 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       }
     };
 
-    // 1. Synchronous 0ms Instant Check (from static-db.json or prefetched cache):
-    // Mount the <video> player immediately on frame 1 with zero extra re-renders!
-    const instantCached = getInstantCachedDetail(movie.path || movie.url, movie.title);
-    if (instantCached && instantCached.episodes && instantCached.episodes.length > 0) {
-      setLoading(false);
-      applyResolvedDetail(instantCached, detail === instantCached);
-      // Background non-blocking enrich after 2.5s: APPEND any newly discovered servers to the END
-      // of the sources list so `sources[selectedSourceIdx]` NEVER changes URL mid-playback!
-      const enrichTimer = window.setTimeout(() => {
+    const scheduleBackgroundEnrich = (resolvedDetail?: MovieDetailData) => {
+      // If a movie (single episode) already has direct ad-free streams, do NOT re-scrape or mutate its server list!
+      const existingEps = resolvedDetail?.episodes || [];
+      const hasDirectStream = existingEps.some((ep) =>
+        ep.sources?.some(
+          (s) => s.type !== 'embed' && !/abyssplayer\.com|vidsrc|\/embed\//i.test(s.url || '')
+        )
+      );
+      if (hasDirectStream && existingEps.length === 1 && movie.typeBadge === 'MOVIE') {
+        return null;
+      }
+      return window.setTimeout(() => {
         if (cancelled) return;
         const params = new URLSearchParams({
           path: movie.path || movie.url,
@@ -713,45 +714,49 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
             if (!cancelled && data?.ok && data?.detail?.episodes?.length) {
               setDetail((prev) => {
                 if (!prev || !prev.episodes?.length) return data.detail;
-                let addedAny = false;
-                const mergedEpisodes = prev.episodes.map((ep, idx) => {
-                  const incomingEp = data.detail.episodes?.[idx];
-                  if (!incomingEp?.sources?.length) return ep;
-                  const existingUrls = new Set((ep.sources || []).map((s) => s.url));
-                  const extraSources = incomingEp.sources.filter(
-                    (s: StreamSource) => s.url && !existingUrls.has(s.url)
-                  );
-                  if (extraSources.length === 0) return ep;
-                  addedAny = true;
-                  return {
-                    ...ep,
-                    sources: [...(ep.sources || []), ...extraSources],
-                  };
-                });
                 if (data.detail.episodes.length > prev.episodes.length) {
                   const newEpisodes = data.detail.episodes.slice(prev.episodes.length);
-                  mergedEpisodes.push(...newEpisodes);
-                  addedAny = true;
+                  return { ...prev, episodes: [...prev.episodes, ...newEpisodes] };
                 }
-                return addedAny ? { ...prev, episodes: mergedEpisodes } : prev;
+                return prev;
               });
             }
           })
           .catch(() => {});
-      }, 2500);
+      }, 4500);
+    };
+
+    // 1. Synchronous 0ms Instant Check (from static-db.json or prefetched cache):
+    // Mount the <video> player immediately on frame 1 with zero extra re-renders!
+    const instantCached = getInstantCachedDetail(movie.path || movie.url, movie.title);
+    if (instantCached && instantCached.episodes && instantCached.episodes.length > 0) {
+      setLoading(false);
+      applyResolvedDetail(instantCached, detail === instantCached);
+      const enrichTimer = scheduleBackgroundEnrich(instantCached);
       return () => {
         cancelled = true;
-        window.clearTimeout(enrichTimer);
+        if (enrichTimer) window.clearTimeout(enrichTimer);
       };
     }
 
-    setLoading(true);
-    setDetail(null);
-    setSelectedEpIdx(savedProgress?.episodeIdx || 0);
-    setSelectedSourceIdx(0);
-
+    let enrichTimer: number | null = null;
     const fetchDetail = async () => {
       try {
+        // 2. Fast local shard lookup (~5ms) before showing loading state or making a network trip!
+        const shardHit = await loadShardForMovie(movie.path || movie.url, movie.title);
+        if (cancelled) return;
+        if (shardHit && shardHit.episodes && shardHit.episodes.length > 0) {
+          setLoading(false);
+          applyResolvedDetail(shardHit);
+          enrichTimer = scheduleBackgroundEnrich(shardHit);
+          return;
+        }
+
+        setLoading(true);
+        setDetail(null);
+        setSelectedEpIdx(savedProgress?.episodeIdx || 0);
+        setSelectedSourceIdx(0);
+
         const params = new URLSearchParams({
           path: movie.path || movie.url,
           title: movie.title,
@@ -779,6 +784,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     fetchDetail();
     return () => {
       cancelled = true;
+      if (enrichTimer) window.clearTimeout(enrichTimer);
     };
   }, [movie?.path, movie?.url, activeNodeId]);
 
@@ -902,12 +908,24 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const activeEpisode: EpisodeItem | undefined = episodes[selectedEpIdx] || episodes[0];
   const sources = useMemo<StreamSource[]>(() => {
     const rawList = activeEpisode?.sources ? [...activeEpisode.sources] : [];
-    // Filter out third-party embed iframes (abyssplayer.com etc.) whenever direct ad-free <video> streams exist!
+    // Filter out third-party embed iframes (abyssplayer.com etc.) whenever direct ad-free <video> streams exist,
+    // and sort so lightweight 480p H.264 is ALWAYS Server 1 (index 0), 720p is Server 2, and 1080p is Server 3!
     const directVideoSources = rawList.filter(
       (s) => s.type !== 'embed' && !/abyssplayer\.com|vidsrc|\/embed\//i.test(s.url || '')
     );
     if (directVideoSources.length > 0) {
-      return directVideoSources;
+      const score = (src: StreamSource) => {
+        const isHevc = /\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${src.name} ${src.qualityLabel}`);
+        const isBestHeavy = /best\s*quality/i.test(src.qualityLabel || '');
+        let sc = isHevc ? 200 : 1000;
+        if (isBestHeavy) sc -= 250;
+        if (src.quality >= 360 && src.quality <= 576) sc += 650;
+        else if (src.quality === 720) sc += 500;
+        else if (src.quality === 1080) sc += 350;
+        else sc += 150;
+        return sc;
+      };
+      return [...directVideoSources].sort((a, b) => score(b) - score(a));
     }
 
     const base = [...rawList];
@@ -1308,9 +1326,12 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       if (isM3u8 && Hls.isSupported() && !v.canPlayType('application/vnd.apple.mpegurl')) {
         const hls = new Hls({
           enableWorker: true,
-          maxBufferLength: 20,
-          maxMaxBufferLength: 40,
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+          backBufferLength: 30,
           startFragPrefetch: true,
+          testBandwidth: true,
+          abrEwmaDefaultEstimate: 2_500_000,
         });
         hlsInstanceRef.current = hls;
         hls.loadSource(effectiveVideoUrl);
@@ -1340,10 +1361,33 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       if (curV && curV.readyState < 2 && !curV.paused) {
         setIsBuffering(true);
       }
-    }, 600);
+    }, 500);
+
+    // Patient 12s Startup Watchdog: only switch servers if current server fails to even deliver metadata (readyState === 0) after 12s!
+    // Never interrupt an active MKV stream at 2s-4s while it is completing its Range handshake on mobile networks.
+    if (startupWatchdogTimerRef.current) {
+      window.clearTimeout(startupWatchdogTimerRef.current);
+    }
+    startupWatchdogTimerRef.current = window.setTimeout(() => {
+      const curV = videoRef.current;
+      if (curV && curV.readyState === 0 && sources.length > 1) {
+        const nextFailed = Array.from(new Set([...failedSourceIndices, selectedSourceIdx]));
+        const nextIdx = sources.findIndex(
+          (s, idx) => !nextFailed.includes(idx) && s.type !== 'embed'
+        );
+        if (nextIdx !== -1) {
+          setFailedSourceIndices(nextFailed);
+          setSelectedSourceIdx(nextIdx);
+        }
+      }
+    }, 12000);
 
     return () => {
       window.clearTimeout(bufTimer);
+      if (startupWatchdogTimerRef.current) {
+        window.clearTimeout(startupWatchdogTimerRef.current);
+        startupWatchdogTimerRef.current = null;
+      }
       if (hlsInstanceRef.current) {
         hlsInstanceRef.current.destroy();
         hlsInstanceRef.current = null;
@@ -1429,7 +1473,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     if (!ctrl || iosTransitioningRef.current || isSeekingRef.current) return false;
     iosTransitioningRef.current = true;
     try {
-      const nextSeg = await ctrl.ensureNextSegmentPrebuffered(iosCurrentSegIndexRef.current + 1);
+      const nextSeg = await ctrl.ensureNextSegmentPrebuffered(iosCurrentSegIndexRef.current + 1, 0);
       if (nextSeg && iosControllerRef.current === ctrl && !isSeekingRef.current) {
         const monotonicStartSec = Math.max(
           iosSegmentStartSecRef.current,
@@ -1442,12 +1486,17 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         setIosCurrentSegIndex(nextSeg.index);
         setIosSegmentStartSec(monotonicStartSec);
         setIosBlobUrl(nextSeg.blobUrl);
-        ctrl.ensureNextSegmentPrebuffered(nextSeg.index + 1);
+        void ctrl.ensureNextSegmentPrebuffered(nextSeg.index + 1, 0);
+        window.setTimeout(() => {
+          iosTransitioningRef.current = false;
+        }, 420);
         return true;
       }
-      return false;
-    } finally {
       iosTransitioningRef.current = false;
+      return false;
+    } catch {
+      iosTransitioningRef.current = false;
+      return false;
     }
   };
 
@@ -1669,9 +1718,16 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       globalTime < muteWindowSec &&
       (!dur || dur > muteWindowSec + 25);
 
-    if (isMuted || inVoiceTagWindow) {
+    if (isMuted) {
       v.volume = 0;
       v.muted = true;
+    } else if (inVoiceTagWindow) {
+      v.volume = 0;
+      if (useHlsBridge) {
+        v.muted = true;
+      } else {
+        v.muted = false;
+      }
     } else {
       v.volume = Math.max(0, Math.min(1, volume / 100));
       v.muted = false;
@@ -1694,8 +1750,12 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     } else if (!useHlsBridge && v.duration > 0) {
       setDuration(Math.floor(v.duration));
     }
-    setHasStartedPlayback(true);
-    setIsBuffering(false);
+    // Only mark hasStartedPlayback when the first video frame is actually decoded (readyState >= 2)
+    // so the poster overlay never disappears prematurely into a black screen!
+    if (v.readyState >= 2) {
+      setHasStartedPlayback(true);
+      setIsBuffering(false);
+    }
 
     // Silence any upstream intro audio tag immediately before first frame plays
     syncCleanAudioVolume(v);
@@ -2687,7 +2747,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   ? 'relative w-full aspect-video bg-black select-none'
                   : isLandscapeMode || isFullscreen
                     ? 'fixed inset-0 z-[9999] w-screen h-screen bg-black flex items-center justify-center select-none touch-none'
-                    : 'relative w-full aspect-video bg-black overflow-hidden select-none touch-none'
+                    : 'relative w-full aspect-video bg-black overflow-hidden select-none'
               }
             >
               {/* Mini-Player Quick Controls */}
@@ -2792,7 +2852,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                       WebkitUserSelect: 'none',
                       userSelect: 'none',
                     }}
-                    muted={isMuted || currentTime < Math.max(13.5, introSkipSec)}
+                    muted={isMuted}
                     controls={!isMiniPlayer}
                     playsInline
                     autoPlay
@@ -2817,6 +2877,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     }}
                     onPlaying={(e) => {
                       const v = e.currentTarget;
+                      if (stallDownshiftTimerRef.current) {
+                        window.clearTimeout(stallDownshiftTimerRef.current);
+                        stallDownshiftTimerRef.current = null;
+                      }
+                      if (startupWatchdogTimerRef.current) {
+                        window.clearTimeout(startupWatchdogTimerRef.current);
+                        startupWatchdogTimerRef.current = null;
+                      }
                       setIsPlaying(true);
                       setHasStartedPlayback(true);
                       setIsBuffering(false);
@@ -2832,6 +2900,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     onLoadedData={(e) => {
                       const v = e.currentTarget;
                       isSeekingRef.current = false;
+                      iosTransitioningRef.current = false;
                       setHasStartedPlayback(true);
                       setIsBuffering(false);
                       syncCleanAudioVolume(v);
@@ -2842,12 +2911,20 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                       } catch {
                         // ignore
                       }
-                      if (useHlsBridge && v.paused && v.currentTime < 0.5) {
+                      if (v.paused && v.currentTime < 0.5) {
                         startVideoWithiOSFallback(v);
                       }
                     }}
                     onCanPlay={(e) => {
                       const v = e.currentTarget;
+                      if (stallDownshiftTimerRef.current) {
+                        window.clearTimeout(stallDownshiftTimerRef.current);
+                        stallDownshiftTimerRef.current = null;
+                      }
+                      if (startupWatchdogTimerRef.current) {
+                        window.clearTimeout(startupWatchdogTimerRef.current);
+                        startupWatchdogTimerRef.current = null;
+                      }
                       isSeekingRef.current = false;
                       setHasStartedPlayback(true);
                       setIsBuffering(false);
@@ -2866,6 +2943,36 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     onWaiting={() => {
                       smoothPlaySecondsRef.current = 0;
                       setIsBuffering(true);
+                      // Only downshift if already playing a heavy HD stream (> 576p) and it stalls mid-movie for > 8s!
+                      // Never tear down the stream during initial startup!
+                      if (stallDownshiftTimerRef.current) {
+                        window.clearTimeout(stallDownshiftTimerRef.current);
+                      }
+                      if (
+                        autoNetQuality &&
+                        hasStartedPlayback &&
+                        currentTime > 5 &&
+                        (activeSource?.quality || 480) > 576 &&
+                        sources.length > 1 &&
+                        !hasStalledInSessionRef.current
+                      ) {
+                        stallDownshiftTimerRef.current = window.setTimeout(() => {
+                          const v = videoRef.current;
+                          if (!v || v.readyState >= 3) return;
+                          const curQ = activeSource?.quality || 720;
+                          const lighterIdx = sources.findIndex(
+                            (s, idx) =>
+                              idx !== selectedSourceIdx &&
+                              !failedSourceIndices.includes(idx) &&
+                              s.type !== 'embed' &&
+                              s.quality < curQ
+                          );
+                          if (lighterIdx !== -1) {
+                            hasStalledInSessionRef.current = true;
+                            handleSelectSource(lighterIdx, false);
+                          }
+                        }, 8000);
+                      }
                     }}
                     onSeeked={(e) => {
                       const v = e.currentTarget;
@@ -2899,16 +3006,43 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                         if (!hasStartedPlayback) setHasStartedPlayback(true);
                         if (isBuffering) setIsBuffering(false);
                       }
+                      try {
+                        if (v.buffered && v.buffered.length > 0) {
+                          const rawBufEnd = v.buffered.end(v.buffered.length - 1);
+                          const globalBufEnd = useHlsBridge
+                            ? iosSegmentStartSecRef.current + rawBufEnd
+                            : rawBufEnd;
+                          if (Math.abs(globalBufEnd - bufferedEnd) >= 1) {
+                            setBufferedEnd(Math.floor(globalBufEnd));
+                          }
+                        }
+                      } catch {
+                        // ignore
+                      }
                       const segDur = v.duration || 0;
-                      if (
-                        useHlsBridge &&
-                        iosControllerRef.current &&
-                        segDur > 0 &&
-                        segDur - v.currentTime < 6.5
-                      ) {
-                        iosControllerRef.current.ensureNextSegmentPrebuffered(
-                          iosCurrentSegIndexRef.current + 1
-                        );
+                      if (useHlsBridge && iosControllerRef.current && segDur > 0) {
+                        // Trigger next segment pre-buffer early (when < 11s left) AND prime hardware decoder
+                        if (segDur - v.currentTime < 11) {
+                          const nextSegIdx = iosCurrentSegIndexRef.current + 1;
+                          iosControllerRef.current
+                            .ensureNextSegmentPrebuffered(nextSegIdx, 0)
+                            .then((readySeg) => {
+                              if (
+                                readySeg?.blobUrl &&
+                                preloadVideoRef.current &&
+                                preloadVideoRef.current.src !== readySeg.blobUrl
+                              ) {
+                                preloadVideoRef.current.src = readySeg.blobUrl;
+                                preloadVideoRef.current.load();
+                              }
+                            })
+                            .catch(() => {});
+                        }
+                        // Proactive seamless transition 140ms before segment end so Safari never pauses at EOF!
+                        if (segDur > 2 && segDur - v.currentTime <= 0.14) {
+                          void advanceToNextIosSegment();
+                          return;
+                        }
                       }
                       const globalSec = Math.floor(
                         useHlsBridge
@@ -2952,6 +3086,33 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     }}
                     onError={handleVideoError}
                     className="w-full h-full bg-black object-contain select-none"
+                  />
+                  {/* Zero-Black-Screen Poster & Buffering Shield until First Video Frame is Decoded */}
+                  {!hasStartedPlayback && (
+                    <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black">
+                      {(movie.poster || effectiveDetail?.poster) && (
+                        <img
+                          src={movie.poster || effectiveDetail?.poster}
+                          alt={movie.title}
+                          className="absolute inset-0 w-full h-full object-contain opacity-65"
+                        />
+                      )}
+                      <div className="relative z-10 flex flex-col items-center gap-2 px-4 py-2 rounded-xl bg-black/65 backdrop-blur-xs">
+                        <Loader2 className="w-7 h-7 animate-spin text-[#dc2626]" />
+                        <span className="text-[11px] font-semibold text-white tracking-wide">
+                          Starting Stream...
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Hidden Hardware Pre-Decoder for Zero-Gap Segment Handover */}
+                  <video
+                    ref={preloadVideoRef}
+                    muted
+                    playsInline
+                    preload="auto"
+                    className="hidden pointer-events-none w-0 h-0 opacity-0"
                   />
 
                   {/* iOS 1-Tap Unmute Pill if Safari blocked unmuted autoplay after 13.5s */}

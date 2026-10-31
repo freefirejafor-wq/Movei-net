@@ -1041,6 +1041,16 @@ export interface CachedMkvStreamMeta {
   firstClusterOffset: number;
   cuesByteOffset: number;
   cuePoints: MkvCuePoint[];
+  initialSeg0Mp4?: {
+    mp4Bytes: Uint8Array;
+    startSec: number;
+    durationSec: number;
+    maxPtsMs: number;
+    nextByteOffset: number;
+    carryVideo: VideoSample[];
+    carryAudio: AudioSample[];
+    subtitles: MkvSubtitleSample[];
+  };
 }
 
 const mkvStreamMetaCache = new Map<string, CachedMkvStreamMeta>();
@@ -1051,7 +1061,12 @@ export function prewarmMkvStreamMeta(url: string): Promise<CachedMkvStreamMeta |
     return Promise.resolve(null);
   }
   const existing = mkvStreamMetaCache.get(url);
-  if (existing && existing.tracks.length > 0 && existing.cuePoints.length > 0) {
+  if (
+    existing &&
+    existing.tracks.length > 0 &&
+    existing.cuePoints.length > 0 &&
+    existing.initialSeg0Mp4
+  ) {
     return Promise.resolve(existing);
   }
   const inFlight = inFlightMetaPrewarms.get(url);
@@ -1059,10 +1074,10 @@ export function prewarmMkvStreamMeta(url: string): Promise<CachedMkvStreamMeta |
 
   const p = (async (): Promise<CachedMkvStreamMeta | null> => {
     try {
-      // 1. Fetch tiny 24 KB header (Matroska EBML + SeekHead + SegmentInfo + Tracks is only ~1.5 KB!)
-      const HEADER_BYTES = 24 * 1024;
+      // 1. Fetch 420 KB opening burst (Matroska EBML + Tracks + Cluster #0) so Segment 0 is pre-built in RAM!
+      const OPENING_BURST_BYTES = 420 * 1024;
       const res = await fetch(url, {
-        headers: { Range: `bytes=0-${HEADER_BYTES - 1}` },
+        headers: { Range: `bytes=0-${OPENING_BURST_BYTES - 1}` },
       });
       if (!res.ok && res.status !== 206) return null;
 
@@ -1077,6 +1092,53 @@ export function prewarmMkvStreamMeta(url: string): Promise<CachedMkvStreamMeta |
       const parsed = parseMkvHeaderAndSamples(buf);
       if (parsed.tracks.length === 0) return null;
 
+      let initialSeg0Mp4: CachedMkvStreamMeta['initialSeg0Mp4'] = undefined;
+      if (parsed.videoSamples.length >= 2) {
+        let vForSeg = parsed.videoSamples;
+        let aForSeg = parsed.audioSamples;
+        let carryVideo: VideoSample[] = [];
+        let carryAudio: AudioSample[] = [];
+        const endedAtCompleteCluster =
+          parsed.consumedBytes > 0 && parsed.consumedBytes < buf.byteLength;
+        if (!endedAtCompleteCluster) {
+          let lastKf = -1;
+          for (
+            let i = vForSeg.length - 1;
+            i >= Math.min(20, Math.floor(vForSeg.length * 0.65));
+            i--
+          ) {
+            if (vForSeg[i].keyframe) {
+              lastKf = i;
+              break;
+            }
+          }
+          if (lastKf > 12 && lastKf < vForSeg.length - 1) {
+            const splitPts = vForSeg[lastKf].ptsMs;
+            carryVideo = vForSeg.slice(lastKf);
+            vForSeg = vForSeg.slice(0, lastKf);
+            carryAudio = aForSeg.filter((a) => a.ptsMs >= splitPts);
+            aForSeg = aForSeg.filter((a) => a.ptsMs < splitPts);
+          }
+        }
+        const built = buildFastStartMp4(parsed.tracks, vForSeg, aForSeg);
+        if (built) {
+          let maxPtsMs = 0;
+          for (const s of vForSeg) {
+            if (s.ptsMs > maxPtsMs) maxPtsMs = s.ptsMs;
+          }
+          initialSeg0Mp4 = {
+            mp4Bytes: built.mp4Bytes,
+            startSec: built.startSec,
+            durationSec: built.durationSec,
+            maxPtsMs,
+            nextByteOffset: parsed.consumedBytes > 0 ? parsed.consumedBytes : buf.byteLength,
+            carryVideo,
+            carryAudio,
+            subtitles: parsed.subtitleSamples,
+          };
+        }
+      }
+
       const meta: CachedMkvStreamMeta = {
         tracks: parsed.tracks,
         timecodeScale: parsed.timecodeScale,
@@ -1085,12 +1147,13 @@ export function prewarmMkvStreamMeta(url: string): Promise<CachedMkvStreamMeta |
         segmentDataOffset: parsed.segmentDataOffset || 52,
         firstClusterOffset: parsed.firstClusterOffset > 0 ? parsed.firstClusterOffset : 1500,
         cuesByteOffset: parsed.cuesByteOffset,
-        cuePoints: [],
+        cuePoints: existing?.cuePoints || [],
+        initialSeg0Mp4,
       };
       mkvStreamMetaCache.set(url, meta);
 
       // 2. Immediately fetch the Cues keyframe index (using exact SeekHead offset or 384 KB tail)
-      if (totalFileBytes > 220_000) {
+      if (totalFileBytes > 220_000 && meta.cuePoints.length === 0) {
         const tailStart =
           meta.cuesByteOffset > 0 && meta.cuesByteOffset < totalFileBytes
             ? meta.cuesByteOffset
@@ -1360,15 +1423,57 @@ export class IosMkvStreamController {
     // so the committed seek on release executes with zero connection contention!
   }
 
+  public getPrebufferedSegmentUrl(targetIndex: number): string {
+    const found = this.segments.find((s) => s.index === targetIndex && s.blobUrl);
+    return found ? found.blobUrl : '';
+  }
+
   public async startInitialSegment(): Promise<RemuxedSegmentItem> {
     this.lastEmittedVideoPtsMs = -1;
     const isResumeJump = this.initialResumeSec > 15;
 
-    // ULTRA-FAST 1-REQUEST STARTUP (~240ms):
-    // When starting from the beginning (0:00), fetch the first 600 KB (header + Tracks + Cluster #0)
-    // in a SINGLE HTTP Range request instead of 3 sequential requests!
+    // 0ms RAM INSTANT STARTUP: If prewarmMkvStreamMeta already built Segment 0 in RAM, return it in 0ms!
     if (!isResumeJump) {
-      const SINGLE_SHOT_BYTES = 600 * 1024;
+      const prewarmed = mkvStreamMetaCache.get(this.url);
+      if (prewarmed && prewarmed.tracks.length > 0 && prewarmed.initialSeg0Mp4) {
+        this.tracks = prewarmed.tracks;
+        this.timecodeScale = prewarmed.timecodeScale;
+        this.totalDurationSec = prewarmed.totalDurationSec;
+        this.totalFileBytes = prewarmed.totalFileBytes;
+        this.segmentDataOffset = prewarmed.segmentDataOffset || 52;
+        this.cuesByteOffset = prewarmed.cuesByteOffset;
+        this.cuePoints = prewarmed.cuePoints || [];
+
+        const init0 = prewarmed.initialSeg0Mp4;
+        this.lastEmittedVideoPtsMs = init0.maxPtsMs;
+        this.nextByteOffset = init0.nextByteOffset;
+        this.carryVideo = [...init0.carryVideo];
+        this.carryAudio = [...init0.carryAudio];
+        this.mergeSubtitleSamples(init0.subtitles);
+        if (this.totalFileBytes > 0 && this.nextByteOffset >= this.totalFileBytes) {
+          this.eofReached = true;
+        }
+
+        const blob = new Blob([init0.mp4Bytes as unknown as BlobPart], {
+          type: 'video/mp4',
+        });
+        const seg0: RemuxedSegmentItem = {
+          index: 0,
+          blobUrl: URL.createObjectURL(blob),
+          startSec: init0.startSec,
+          durationSec: init0.durationSec,
+        };
+        this.segments.push(seg0);
+        this.ensureNextSegmentPrebuffered(1, 0);
+        if (this.cuePoints.length === 0) {
+          this.ensureCuesTableLoaded();
+        }
+        return seg0;
+      }
+
+      // ULTRA-FAST 1-REQUEST STARTUP (~160ms):
+      // Fetch 450 KB (header + Tracks + Cluster #0) in a SINGLE HTTP Range request!
+      const SINGLE_SHOT_BYTES = 450 * 1024;
       const res = await fetch(this.url, {
         signal: this.abortController.signal,
         headers: {
@@ -1444,15 +1549,8 @@ export class IosMkvStreamController {
         );
         if (seg0) {
           this.segments.push(seg0);
-          if (this.cuePoints.length > 0) {
-            this.ensureNextSegmentPrebuffered(1);
-          } else {
-            this.ensureCuesTableLoaded().finally(() => {
-              if (!this.aborted && this.segments.length === 1) {
-                this.ensureNextSegmentPrebuffered(1);
-              }
-            });
-          }
+          // Immediately pipeline Segment #1 (and Segment #2) in the background!
+          this.ensureNextSegmentPrebuffered(1, 0);
           return seg0;
         }
       }
@@ -1757,10 +1855,16 @@ export class IosMkvStreamController {
 
   public ensureNextSegmentPrebuffered(
     targetIndex: number,
-    _chainDepth = 0
+    chainDepth = 0
   ): Promise<RemuxedSegmentItem | null> {
     const existing = this.segments.find((s) => s.index === targetIndex && s.blobUrl);
     if (existing) {
+      if (chainDepth < 1 && !this.eofReached && !this.aborted) {
+        const nextAhead = this.segments.find((s) => s.index === targetIndex + 1 && s.blobUrl);
+        if (!nextAhead && !this.buildingPromise) {
+          void this.ensureNextSegmentPrebuffered(targetIndex + 1, chainDepth + 1);
+        }
+      }
       return Promise.resolve(existing);
     }
     if (this.buildingPromise) return this.buildingPromise;
@@ -1778,7 +1882,7 @@ export class IosMkvStreamController {
 
         if (!this.eofReached) {
           const rangeStart = this.nextByteOffset;
-          const desiredBytes = 2_400_000;
+          const desiredBytes = 2_200_000;
           let rangeEnd =
             this.totalFileBytes > 0
               ? Math.min(this.totalFileBytes - 1, rangeStart + desiredBytes - 1)
@@ -1786,7 +1890,9 @@ export class IosMkvStreamController {
 
           if (this.cuePoints.length >= 2) {
             const nextCue = this.cuePoints.find(
-              (c) => c.byteOffset >= rangeStart + 1_500_000 && c.byteOffset <= rangeStart + desiredBytes + 1_100_000
+              (c) =>
+                c.byteOffset >= rangeStart + 1_350_000 &&
+                c.byteOffset <= rangeStart + desiredBytes + 1_000_000
             );
             if (nextCue) {
               rangeEnd = nextCue.byteOffset - 1;
@@ -1839,8 +1945,8 @@ export class IosMkvStreamController {
         );
         if (seg) {
           this.segments.push(seg);
-          if (this.segments.length > 5) {
-            const toRemove = this.segments.slice(0, this.segments.length - 5);
+          if (this.segments.length > 6) {
+            const toRemove = this.segments.slice(0, this.segments.length - 6);
             for (const old of toRemove) {
               if (old.blobUrl) {
                 try {
@@ -1861,6 +1967,10 @@ export class IosMkvStreamController {
         this.buildingPromise = null;
         if (this.bgPrebufferAbortController === bgCtrl) {
           this.bgPrebufferAbortController = null;
+        }
+        // Automatically pipeline the 2nd segment ahead so ~35 seconds of video stay pre-remuxed in RAM!
+        if (chainDepth < 1 && !this.aborted && !this.eofReached) {
+          void this.ensureNextSegmentPrebuffered(targetIndex + 1, chainDepth + 1);
         }
       }
     })();
