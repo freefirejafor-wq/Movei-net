@@ -1,0 +1,76 @@
+name: Deploy CinePulse HD to GitHub Pages
+
+on:
+  push:
+    branches: ['main', 'master']
+  schedule:
+    # Automatically refresh static movie cache every 15 minutes on GitHub Pages
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: 'pages'
+  cancel-in-progress: true
+
+jobs:
+  build_and_deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Build static database & production bundle
+        run: npm run build:github
+
+      - name: Deploy to gh-pages branch (auto-creates branch for branch-based Pages)
+        uses: peaceiris/actions-gh-pages@v4
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+
+      - name: Check if GitHub Pages is enabled in repo settings
+        id: check_pages
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pages")
+          if [ "$STATUS" = "200" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Pages
+        id: pages
+        if: steps.check_pages.outputs.enabled == 'true'
+        uses: actions/configure-pages@v5
+        continue-on-error: true
+
+      - name: Upload artifact
+        if: steps.check_pages.outputs.enabled == 'true' && steps.pages.outcome == 'success'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+      - name: Deploy to GitHub Pages
+        if: steps.check_pages.outputs.enabled == 'true' && steps.pages.outcome == 'success'
+        id: deployment
+        uses: actions/deploy-pages@v4
