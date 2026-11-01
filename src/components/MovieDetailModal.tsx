@@ -103,6 +103,120 @@ const INTRO_SKIP_STORAGE_KEY = 'cp_intro_skip_sec_v3';
 const AUTO_NEXT_STORAGE_KEY = 'cp_auto_next_ep_v1';
 const BRIGHTNESS_STORAGE_KEY = 'cp_player_brightness_v1';
 const AUTO_NET_STORAGE_KEY = 'cp_auto_net_quality_v1';
+const SOUND_BOOST_STORAGE_KEY = 'cp_sound_boost_vol_v1';
+
+interface WebAudioBoosterNodeChain {
+  ctx: AudioContext;
+  gainNode: GainNode;
+  vocalFilter: BiquadFilterNode;
+  compressor: DynamicsCompressorNode;
+}
+
+const videoAudioBoosterMap = new WeakMap<HTMLMediaElement, WebAudioBoosterNodeChain>();
+
+/**
+ * Applies up to 400% (4.0x) Ultra Sound Boost + Vocal Clarity EQ + Anti-Clipping Compressor
+ * via Web Audio API when volumePercent > 100.
+ */
+function syncVideoAudioBooster(videoEl: HTMLVideoElement, volumePercent: number, muted: boolean): void {
+  try {
+    if (muted || volumePercent <= 0) {
+      videoEl.volume = 0;
+      videoEl.muted = true;
+      const existing = videoAudioBoosterMap.get(videoEl);
+      if (existing) {
+        existing.gainNode.gain.value = 1;
+        existing.vocalFilter.gain.value = 0;
+      }
+      return;
+    }
+
+    videoEl.muted = false;
+
+    if (volumePercent <= 100) {
+      videoEl.volume = Math.max(0, Math.min(1, volumePercent / 100));
+      const existing = videoAudioBoosterMap.get(videoEl);
+      if (existing) {
+        existing.gainNode.gain.value = 1;
+        existing.vocalFilter.gain.value = 0;
+        if (existing.ctx.state === 'suspended') {
+          existing.ctx.resume().catch(() => {});
+        }
+      }
+      return;
+    }
+
+    // volumePercent > 100 (101% .. 400% Ultra Sound Boost)
+    videoEl.volume = 1;
+
+    let chain = videoAudioBoosterMap.get(videoEl);
+    if (!chain) {
+      // Only attach Web Audio MediaElementSource on same-origin (/api/stream) or blob: streams
+      // so cross-origin streams without CORS headers are never silenced
+      const currentSrc = videoEl.currentSrc || videoEl.src || '';
+      const isSameOriginOrBlob =
+        !currentSrc ||
+        currentSrc.startsWith('blob:') ||
+        currentSrc.startsWith('data:') ||
+        currentSrc.startsWith('/') ||
+        currentSrc.includes('/api/stream') ||
+        (typeof window !== 'undefined' && currentSrc.startsWith(window.location.origin));
+
+      if (!isSameOriginOrBlob) {
+        return;
+      }
+
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+
+      const ctx: AudioContext = new AudioCtx();
+      const source = ctx.createMediaElementSource(videoEl);
+
+      // Vocal Clarity Presence Boost around 2.2kHz so dialogue is crystal clear when boosted
+      const vocalFilter = ctx.createBiquadFilter();
+      vocalFilter.type = 'peaking';
+      vocalFilter.frequency.value = 2200;
+      vocalFilter.Q.value = 1.0;
+      vocalFilter.gain.value = 0;
+
+      // Main Amplifier Gain Node (1.0x up to 4.0x)
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = 1;
+
+      // Dynamics Compressor / Limiter so 200%–400% loud explosions never crackle or clip
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = -10;
+      compressor.knee.value = 16;
+      compressor.ratio.value = 4;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.15;
+
+      source.connect(vocalFilter);
+      vocalFilter.connect(gainNode);
+      gainNode.connect(compressor);
+      compressor.connect(ctx.destination);
+
+      chain = { ctx, gainNode, vocalFilter, compressor };
+      videoAudioBoosterMap.set(videoEl, chain);
+    }
+
+    if (chain.ctx.state === 'suspended') {
+      chain.ctx.resume().catch(() => {});
+    }
+
+    const boostMultiplier = Math.max(1, Math.min(4, volumePercent / 100));
+    chain.gainNode.gain.value = boostMultiplier;
+    // Add up to +6dB vocal dialogue clarity as boost increases from 100% to 400%
+    chain.vocalFilter.gain.value = Math.min(6, ((boostMultiplier - 1) / 3) * 6);
+  } catch {
+    // Fallback if browser restricts Web Audio API on this element
+    try {
+      videoEl.volume = Math.max(0, Math.min(1, volumePercent / 100));
+    } catch {
+      // ignore
+    }
+  }
+}
 
 function formatSeconds(sec: number): string {
   if (!sec || sec < 0 || !isFinite(sec)) return '00:00';
@@ -400,7 +514,18 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     }
   });
   const [showBrightnessPanel, setShowBrightnessPanel] = useState(false);
-  const [volume, setVolume] = useState<number>(100);
+  const [volume, setVolume] = useState<number>(() => {
+    try {
+      const saved = Number(localStorage.getItem(SOUND_BOOST_STORAGE_KEY));
+      if (!Number.isNaN(saved) && saved >= 10 && saved <= 400) {
+        return Math.round(saved);
+      }
+    } catch {
+      // ignore
+    }
+    return 100;
+  });
+  const [showSoundBoostBar, setShowSoundBoostBar] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [autoMutedForiOS, setAutoMutedForiOS] = useState<boolean>(false);
 
@@ -1812,8 +1937,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const handleSelectEpisode = (idx: number) => {
     setSelectedEpIdx(idx);
     const ep = episodes[idx];
-    const bestSrcIdx = pickBestSourceIndexForNet(ep?.sources || [], autoNetQuality);
-    setSelectedSourceIdx(bestSrcIdx);
+    setSelectedSourceIdx(0);
     setFailedSourceIndices([]);
     setPlayerMode('stream');
     setVideoError(false);
@@ -1834,11 +1958,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     hasUserManualServerRef.current = false;
     hasAppliedIntroSkipRef.current = false;
     pendingResumeSecRef.current = null;
-    const src = ep?.sources?.[bestSrcIdx] || ep?.sources?.[0];
-    if (src?.url && src.type !== 'embed') {
-      warmStreamConnection(src.url);
+    const directSrc =
+      (ep?.sources || []).find(
+        (s) => s.type !== 'embed' && !/abyssplayer\.com|abysscdn\.com|vidsrc|\/embed\//i.test(s.url || '')
+      ) || ep?.sources?.[0];
+    if (directSrc?.url && directSrc.type !== 'embed') {
+      warmStreamConnection(directSrc.url);
     }
-    onRecordWatchProgress(movie, ep, idx, src, 0);
+    onRecordWatchProgress(movie, ep, idx, directSrc, 0);
   };
 
   const handleSelectSource = (idx: number, isManualChoice = false) => {
@@ -1926,8 +2053,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       (!dur || dur > muteWindowSec + 25);
 
     if (isMuted) {
-      v.volume = 0;
-      v.muted = true;
+      syncVideoAudioBooster(v, 0, true);
     } else if (inVoiceTagWindow) {
       v.volume = 0;
       if (useHlsBridge) {
@@ -1936,8 +2062,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         v.muted = false;
       }
     } else {
-      v.volume = Math.max(0, Math.min(1, volume / 100));
-      v.muted = false;
+      syncVideoAudioBooster(v, volume, false);
     }
   };
 
@@ -2139,8 +2264,36 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     const v = videoRef.current;
     const nextMuted = !isMuted;
     setIsMuted(nextMuted);
-    if (v) v.muted = nextMuted;
-    triggerHud('volume', nextMuted ? 'Muted' : `Volume ${volume}%`, nextMuted ? 0 : volume);
+    if (v) {
+      syncVideoAudioBooster(v, volume, nextMuted);
+    }
+    const hudPct = nextMuted ? 0 : Math.min(100, Math.round((volume / 400) * 100));
+    triggerHud(
+      'volume',
+      nextMuted
+        ? 'Muted (0%)'
+        : volume > 100
+          ? `🔊 Sound Boost ${volume}%`
+          : `Sound ${volume}%`,
+      hudPct
+    );
+  };
+
+  const handleCycleSoundBoost = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    const nextBoost =
+      isMuted || volume < 100
+        ? 100
+        : volume < 150
+          ? 150
+          : volume < 200
+            ? 200
+            : volume < 300
+              ? 300
+              : volume < 400
+                ? 400
+                : 100;
+    applyVolumeLevel(nextBoost);
   };
 
   const handleChangeBrightness = (newVal: number) => {
@@ -2401,24 +2554,46 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   };
 
   const applyVolumeLevel = (nextV: number) => {
-    const clamped = Math.max(0, Math.min(100, Math.round(nextV)));
+    const clamped = Math.max(0, Math.min(400, Math.round(nextV)));
     setVolume(clamped);
     setIsMuted(clamped === 0);
+    try {
+      if (clamped > 0) {
+        localStorage.setItem(SOUND_BOOST_STORAGE_KEY, String(clamped));
+      }
+    } catch {
+      // ignore
+    }
     if (videoRef.current) {
-      videoRef.current.volume = clamped / 100;
-      videoRef.current.muted = clamped === 0;
+      syncVideoAudioBooster(videoRef.current, clamped, clamped === 0);
     }
     if (embedIframeRef.current?.contentWindow) {
       try {
         embedIframeRef.current.contentWindow.postMessage(
-          JSON.stringify({ context: 'player.js', method: 'setVolume', value: clamped }),
+          JSON.stringify({
+            context: 'player.js',
+            method: 'setVolume',
+            value: Math.min(100, clamped),
+          }),
           '*'
         );
       } catch {
         // ignore
       }
     }
-    triggerHud('volume', clamped === 0 ? 'Muted (0%)' : `Sound ${clamped}%`, clamped, 850);
+    const barPercent =
+      clamped <= 100
+        ? Math.round((clamped / 400) * 100)
+        : Math.min(100, Math.round((clamped / 400) * 100));
+    const label =
+      clamped === 0
+        ? 'Muted (0%)'
+        : clamped > 250
+          ? `🔥 Ultra Sound Boost ${clamped}%`
+          : clamped > 100
+            ? `🔊 Sound Boost ${clamped}%`
+            : `Sound ${clamped}%`;
+    triggerHud('volume', label, barPercent, 950);
   };
 
   const applyBrightnessLevel = (nextB: number) => {
@@ -2497,8 +2672,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       const deltaBrightness = Math.round(dy * 0.75);
       applyBrightnessLevel(g.startVal + deltaBrightness);
     } else {
-      // Left side swipe up/down -> Sound / Volume increase/decrease (0% to 100%)
-      const deltaVol = Math.round(dy * 0.65);
+      // Left side swipe up/down -> Sound & Ultra Sound Boost (0% to 400%)
+      const scale = g.startVal >= 100 || dy > 0 ? 1.65 : 0.95;
+      const deltaVol = Math.round(dy * scale);
       applyVolumeLevel(g.startVal + deltaVol);
     }
   };
@@ -3182,28 +3358,67 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
                     {/* 2. Sound (Volume) & Brightness Controls */}
                     <div className="py-2.5 space-y-2.5">
-                      <div className="space-y-1">
+                      <div className="space-y-1.5">
                         <div className="flex items-center justify-between text-xs font-semibold text-gray-200">
                           <span className="flex items-center gap-1.5">
                             {isMuted || volume === 0 ? (
                               <VolumeX className="w-3.5 h-3.5 text-red-400" />
                             ) : (
-                              <Volume2 className="w-3.5 h-3.5 text-[#dc2626]" />
+                              <Volume2
+                                className={`w-3.5 h-3.5 ${
+                                  volume > 100 ? 'text-emerald-400 animate-pulse' : 'text-[#dc2626]'
+                                }`}
+                              />
                             )}
-                            <span>Sound (সাউন্ড)</span>
+                            <span>
+                              {volume > 100 ? 'Ultra Sound Boost (সাউন্ড বুস্ট)' : 'Sound (সাউন্ড)'}
+                            </span>
                           </span>
-                          <span className="font-mono text-[11px] text-gray-300">
-                            {isMuted ? 0 : volume}%
+                          <span
+                            className={`font-mono text-[11px] font-bold ${
+                              volume > 100 ? 'text-emerald-400' : 'text-gray-300'
+                            }`}
+                          >
+                            {isMuted ? 0 : volume}%{volume > 100 ? ' 🔥' : ''}
                           </span>
                         </div>
                         <input
                           type="range"
                           min={0}
-                          max={100}
+                          max={400}
+                          step={5}
                           value={isMuted ? 0 : volume}
                           onChange={(e) => applyVolumeLevel(Number(e.target.value))}
                           className="w-full h-1.5 bg-white/20 rounded-lg accent-[#dc2626] cursor-pointer"
                         />
+                        {/* Quick 1-Tap Sound Boost Presets (100% Normal -> 400% Max Boost) */}
+                        <div className="grid grid-cols-5 gap-1 pt-0.5">
+                          {[
+                            { val: 100, label: '100%' },
+                            { val: 150, label: '150%' },
+                            { val: 200, label: '200%' },
+                            { val: 300, label: '300%' },
+                            { val: 400, label: '400%🔥' },
+                          ].map((preset) => {
+                            const active = !isMuted && volume === preset.val;
+                            return (
+                              <button
+                                key={preset.val}
+                                type="button"
+                                onClick={() => applyVolumeLevel(preset.val)}
+                                className={`py-1 rounded text-[10px] font-extrabold transition-colors cursor-pointer ${
+                                  active
+                                    ? preset.val > 100
+                                      ? 'bg-emerald-600 text-white shadow'
+                                      : 'bg-[#dc2626] text-white shadow'
+                                    : 'bg-white/[0.07] hover:bg-white/[0.15] text-gray-300'
+                                }`}
+                              >
+                                {preset.label}
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
 
                       <div className="space-y-1">
@@ -3406,9 +3621,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 </div>
               )}
 
-              {/* Mini-Player Quick Controls */}
+              {/* Mini-Player Quick Controls (Resize, Play/Pause, Close & Progress Bar) */}
               {isMiniPlayer && (
-                <div className="pointer-events-none absolute inset-0 z-30 flex flex-col justify-between">
+                <div className="pointer-events-none absolute inset-0 z-30 flex flex-col justify-between bg-gradient-to-t from-black/65 via-transparent to-black/45">
                   <div className="flex items-center justify-between p-1.5">
                     <button
                       type="button"
@@ -3422,17 +3637,42 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                         <Maximize2 className="w-3 h-3" />
                       )}
                     </button>
-                    <button
-                      type="button"
-                      data-mini-close="true"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onClose();
-                      }}
-                      className="pointer-events-auto w-6 h-6 rounded-full bg-black/75 text-white hover:text-red-400 flex items-center justify-center border border-white/20"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
+                    <div className="flex items-center gap-1">
+                      {!isEmbedSource && (
+                        <button
+                          type="button"
+                          data-mini-cycle="true"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleTogglePlayPause();
+                          }}
+                          className="pointer-events-auto w-6 h-6 rounded-full bg-black/75 text-white flex items-center justify-center border border-white/20"
+                        >
+                          {isPlaying ? (
+                            <Pause className="w-3 h-3 fill-current" />
+                          ) : (
+                            <Play className="w-3 h-3 fill-current ml-0.5" />
+                          )}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        data-mini-close="true"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onClose();
+                        }}
+                        className="pointer-events-auto w-6 h-6 rounded-full bg-black/75 text-white hover:text-red-400 flex items-center justify-center border border-white/20"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                  <div className="w-full h-1 bg-white/20 overflow-hidden">
+                    <div
+                      style={{ width: `${progressPercent}%` }}
+                      className="h-full bg-[#dc2626] transition-all duration-150"
+                    />
                   </div>
                 </div>
               )}
@@ -3798,6 +4038,25 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                             dur
                           );
                         }
+                        // Pre-warm next episode stream when within 45s of episode completion
+                        if (
+                          dur > 60 &&
+                          dur - globalSec <= 45 &&
+                          selectedEpIdx + 1 < episodes.length &&
+                          prewarmedNextEpIdxRef.current !== selectedEpIdx + 1
+                        ) {
+                          prewarmedNextEpIdxRef.current = selectedEpIdx + 1;
+                          setNextEpPrewarmed(true);
+                          const nextEp = episodes[selectedEpIdx + 1];
+                          const nextDirect = (nextEp?.sources || []).find(
+                            (s) =>
+                              s.type !== 'embed' &&
+                              !/abyssplayer\.com|abysscdn\.com|vidsrc|\/embed\//i.test(s.url || '')
+                          );
+                          if (nextDirect?.url) {
+                            warmStreamConnection(nextDirect.url);
+                          }
+                        }
                       }
                     }}
                     onEnded={() => {
@@ -3957,7 +4216,28 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                               onClick={handleToggleMute}
                               className="text-white hover:text-[#dc2626] cursor-pointer"
                             >
-                              {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4" />}
+                              {isMuted ? (
+                                <VolumeX className="w-4 h-4 text-red-400" />
+                              ) : (
+                                <Volume2
+                                  className={`w-4 h-4 ${
+                                    volume > 100 ? 'text-emerald-400' : 'text-white'
+                                  }`}
+                                />
+                              )}
+                            </button>
+                            {/* 1-Tap Ultra Sound Boost Button Inside Player Bar (Cycles 100% -> 150% -> 200% -> 300% -> 400%) */}
+                            <button
+                              type="button"
+                              onClick={handleCycleSoundBoost}
+                              title="Tap to Boost Sound up to 400%"
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-sans font-extrabold border transition-colors cursor-pointer ${
+                                !isMuted && volume > 100
+                                  ? 'bg-emerald-600/90 border-emerald-400 text-white shadow'
+                                  : 'bg-white/10 hover:bg-white/20 border-white/20 text-gray-200'
+                              }`}
+                            >
+                              {isMuted ? '0%' : volume > 100 ? `🔊 ${volume}%` : 'Boost+'}
                             </button>
                             <span>
                               {formatSeconds(activePlayheadSec)} / {formatSeconds(displayDuration)}
@@ -4287,6 +4567,27 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
                 <button
                   type="button"
+                  onClick={() => setShowSoundBoostBar((v) => !v)}
+                  className={`h-9 px-3.5 rounded-full text-xs sm:text-sm font-medium flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer ${
+                    showSoundBoostBar || (!isMuted && volume > 100)
+                      ? 'bg-emerald-600/25 border border-emerald-500 text-white'
+                      : 'bg-[#1b1d21] hover:bg-[#25282e] text-gray-200'
+                  }`}
+                >
+                  <Volume2
+                    className={`w-4 h-4 ${
+                      !isMuted && volume > 100 ? 'text-emerald-400' : 'text-[#dc2626]'
+                    }`}
+                  />
+                  <span>
+                    {!isMuted && volume > 100
+                      ? `Sound Boost: ${volume}% 🔥`
+                      : `Sound Boost (${isMuted ? 0 : volume}%)`}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => setShowSeparateQualityBar((v) => !v)}
                   className={`h-9 px-3.5 rounded-full text-xs sm:text-sm font-medium flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer ${
                     showSeparateQualityBar || selectedQualityPref !== 'auto'
@@ -4354,6 +4655,57 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   <span>{autoBanglaSubEnabled ? 'Bangla Sub: ON' : 'Video / Sub'}</span>
                 </button>
               </div>
+
+              {/* Separate Dedicated Sound Booster Bar (Opens when tapping Sound Boost pill) */}
+              {showSoundBoostBar && (
+                <div className="mt-2 p-3 rounded-xl bg-[#14161b] border border-emerald-500/30 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-gray-200 flex items-center gap-1.5">
+                      <Volume2 className="w-4 h-4 text-emerald-400" />
+                      <span>Ultra Sound Booster (ক্লিয়ার ভয়েস ও ৪ গুণ বেশি সাউন্ড):</span>
+                    </span>
+                    <span className="text-xs font-mono font-extrabold text-emerald-400">
+                      {isMuted ? 0 : volume}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={400}
+                    step={5}
+                    value={isMuted ? 0 : volume}
+                    onChange={(e) => applyVolumeLevel(Number(e.target.value))}
+                    className="w-full h-2 bg-white/15 rounded-lg accent-emerald-500 cursor-pointer"
+                  />
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {[
+                      { val: 100, label: '100% Normal' },
+                      { val: 150, label: '150% Clear' },
+                      { val: 200, label: '200% Double (2x)' },
+                      { val: 300, label: '300% Super (3x)' },
+                      { val: 400, label: '400% Max Boost 🔥' },
+                    ].map((preset) => {
+                      const active = !isMuted && volume === preset.val;
+                      return (
+                        <button
+                          key={preset.val}
+                          type="button"
+                          onClick={() => applyVolumeLevel(preset.val)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                            active
+                              ? preset.val > 100
+                                ? 'bg-emerald-600 text-white shadow-md'
+                                : 'bg-[#dc2626] text-white shadow-md'
+                              : 'bg-[#1f2229] text-gray-300 hover:bg-[#2a2e37]'
+                          }`}
+                        >
+                          {preset.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {/* Separate Dedicated Quality Selection Bar (Opens when tapping Quality pill) */}
               {showSeparateQualityBar && (
@@ -4764,11 +5116,11 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               {bottomTab === 'infoCast' && (
                 <div className="space-y-4 bg-[#121418] border border-white/10 rounded-xl p-4">
                   <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-bold text-white">Synopsis & Cast</h3>
+                    <h3 className="text-sm font-bold text-white">Synopsis, Cast & Stills</h3>
                     <button
                       type="button"
                       onClick={() => setBottomTab('forYou')}
-                      className="text-xs text-[#ef4444] font-bold"
+                      className="text-xs text-[#ef4444] font-bold cursor-pointer"
                     >
                       Back to For You
                     </button>
@@ -4778,36 +5130,80 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                       `${effectiveDetail?.title || movie.title} (${displayYear}) — Stream in Full HD with crystal clear audio on CinePulse.`}
                   </p>
                   {combinedCast.length > 0 && (
-                    <div className="flex items-center gap-3 overflow-x-auto no-scrollbar pt-1">
-                      {combinedCast.map((actor, idx) => (
+                    <div className="space-y-2 pt-1">
+                      <div className="text-xs font-bold text-gray-400 uppercase tracking-wider">
+                        Cast & Crew
+                      </div>
+                      <div className="flex items-center gap-3 overflow-x-auto no-scrollbar pt-1">
+                        {combinedCast.map((actor, idx) => (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => {
+                              onClose();
+                              onSearchByActor(actor.name);
+                            }}
+                            className="w-20 shrink-0 flex flex-col items-center text-center cursor-pointer"
+                          >
+                            <div className="w-14 h-14 rounded-full overflow-hidden bg-[#1b1d21] border border-white/10 mb-1.5">
+                              {actor.photo ? (
+                                <img
+                                  src={actor.photo}
+                                  alt={actor.name}
+                                  referrerPolicy="no-referrer"
+                                  className="w-full h-full object-cover"
+                                />
+                              ) : (
+                                <div className="w-full h-full flex items-center justify-center text-gray-400 font-bold text-xs">
+                                  {actor.name.charAt(0)}
+                                </div>
+                              )}
+                            </div>
+                            <span className="text-[11px] font-semibold text-white truncate w-full">
+                              {actor.name}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {combinedScreenshots.length > 0 && (
+                    <div className="space-y-2 pt-1">
+                      <div className="text-xs font-bold text-gray-400 uppercase tracking-wider">
+                        HD Screenshots
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                        {(showAllScreenshots
+                          ? combinedScreenshots
+                          : combinedScreenshots.slice(0, 6)
+                        ).map((shotUrl, idx) => (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => setLightboxImage(shotUrl)}
+                            className="relative aspect-video rounded-lg overflow-hidden bg-[#1b1d21] border border-white/10 group cursor-pointer"
+                          >
+                            <img
+                              src={shotUrl}
+                              alt={`Scene ${idx + 1}`}
+                              referrerPolicy="no-referrer"
+                              loading="lazy"
+                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                            />
+                          </button>
+                        ))}
+                      </div>
+                      {combinedScreenshots.length > 6 && (
                         <button
-                          key={idx}
                           type="button"
-                          onClick={() => {
-                            onClose();
-                            onSearchByActor(actor.name);
-                          }}
-                          className="w-20 shrink-0 flex flex-col items-center text-center"
+                          onClick={() => setShowAllScreenshots((v) => !v)}
+                          className="text-xs font-bold text-[#ef4444] hover:underline cursor-pointer"
                         >
-                          <div className="w-14 h-14 rounded-full overflow-hidden bg-[#1b1d21] border border-white/10 mb-1.5">
-                            {actor.photo ? (
-                              <img
-                                src={actor.photo}
-                                alt={actor.name}
-                                referrerPolicy="no-referrer"
-                                className="w-full h-full object-cover"
-                              />
-                            ) : (
-                              <div className="w-full h-full flex items-center justify-center text-gray-400 font-bold text-xs">
-                                {actor.name.charAt(0)}
-                              </div>
-                            )}
-                          </div>
-                          <span className="text-[11px] font-semibold text-white truncate w-full">
-                            {actor.name}
-                          </span>
+                          {showAllScreenshots
+                            ? 'Show Less'
+                            : `View All Screenshots (${combinedScreenshots.length})`}
                         </button>
-                      ))}
+                      )}
                     </div>
                   )}
                 </div>
@@ -4832,7 +5228,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     <button
                       type="button"
                       onClick={() => setShowDownloadSheet(false)}
-                      className="w-8 h-8 rounded-lg bg-[#1b1d21] text-gray-300 flex items-center justify-center"
+                      className="w-8 h-8 rounded-lg bg-[#1b1d21] text-gray-300 flex items-center justify-center cursor-pointer"
                     >
                       <X className="w-4 h-4" />
                     </button>
@@ -4866,7 +5262,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               </div>
             )}
 
-            {/* Full All-Episodes Modal */}
+            {/* Full All-Episodes Modal with Instant Episode Search & Sort */}
             {showAllEpisodesModal && (
               <div
                 onClick={() => setShowAllEpisodesModal(false)}
@@ -4874,19 +5270,54 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               >
                 <div
                   onClick={(e) => e.stopPropagation()}
-                  className="bg-[#121418] border border-white/15 rounded-2xl w-full max-w-2xl max-h-[80vh] flex flex-col overflow-hidden shadow-2xl"
+                  className="bg-[#121418] border border-white/15 rounded-2xl w-full max-w-2xl max-h-[82vh] flex flex-col overflow-hidden shadow-2xl"
                 >
-                  <div className="p-4 border-b border-white/10 flex items-center justify-between">
-                    <h3 className="text-base font-bold text-white">
-                      All Episodes ({filteredEpisodesWithIdx.length})
-                    </h3>
-                    <button
-                      type="button"
-                      onClick={() => setShowAllEpisodesModal(false)}
-                      className="w-8 h-8 rounded-lg bg-[#1b1d21] hover:bg-[#25282e] text-gray-300 flex items-center justify-center"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
+                  <div className="p-4 border-b border-white/10 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-base font-bold text-white">
+                        All Episodes ({filteredEpisodesWithIdx.length})
+                      </h3>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setEpisodeSortOrder((s) => (s === 'asc' ? 'desc' : 'asc'))
+                          }
+                          className="h-8 px-2.5 rounded-lg bg-[#1b1d21] hover:bg-[#25282e] border border-white/10 text-xs font-semibold text-gray-200 flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <ArrowUpDown className="w-3.5 h-3.5 text-[#ef4444]" />
+                          <span>{episodeSortOrder === 'asc' ? '1 → Last' : 'Last → 1'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowAllEpisodesModal(false)}
+                          className="w-8 h-8 rounded-lg bg-[#1b1d21] hover:bg-[#25282e] text-gray-300 flex items-center justify-center cursor-pointer"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                    {episodes.length > 6 && (
+                      <div className="relative">
+                        <Search className="w-3.5 h-3.5 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={episodeSearchQuery}
+                          onChange={(e) => setEpisodeSearchQuery(e.target.value)}
+                          placeholder="Search episode number (e.g. 12, 45)..."
+                          className="w-full h-9 pl-8 pr-8 rounded-lg bg-[#1b1d21] border border-white/10 text-xs text-white placeholder-gray-400 focus:outline-none focus:border-[#dc2626]"
+                        />
+                        {episodeSearchQuery && (
+                          <button
+                            type="button"
+                            onClick={() => setEpisodeSearchQuery('')}
+                            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
                   <div className="p-4 overflow-y-auto grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-2.5">
                     {filteredEpisodesWithIdx.map(({ ep, idx }) => {
@@ -4901,7 +5332,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                             handleSelectEpisode(idx);
                             setShowAllEpisodesModal(false);
                           }}
-                          className={`h-12 px-2 rounded-xl text-sm font-semibold flex items-center justify-center transition-colors ${
+                          className={`h-12 px-2 rounded-xl text-sm font-semibold flex items-center justify-center transition-colors cursor-pointer ${
                             isSelected
                               ? 'bg-gradient-to-br from-[#dc2626]/30 to-[#7f1d1d]/35 border border-[#dc2626]/60 text-[#ef4444] font-bold'
                               : 'bg-[#1b1d21] hover:bg-[#25282e] text-gray-200'
