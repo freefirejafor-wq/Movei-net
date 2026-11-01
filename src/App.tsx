@@ -129,12 +129,12 @@ export default function App() {
   const [yearFilter, setYearFilter] = useState<'ALL' | '2026' | '2025' | 'OLDER'>('ALL');
   const [sortBy, setSortBy] = useState<'HOT_HYPE' | 'LATEST' | 'RATING' | 'VIEWS' | 'TITLE'>('HOT_HYPE');
 
-  // Anonymized Server Node Selection
+  // Anonymized Server Node Selection (Default: MyFlix Server)
   const [activeNodeId, setActiveNodeId] = useState<string>(() => {
     try {
-      return localStorage.getItem(ACTIVE_NODE_STORAGE_KEY) || 'node-alpha';
+      return localStorage.getItem(ACTIVE_NODE_STORAGE_KEY) || 'node-myflix';
     } catch {
-      return 'node-alpha';
+      return 'node-myflix';
     }
   });
 

@@ -91,11 +91,13 @@ function computeShardHex(str: string): string {
 function sortEpisodeSourcesFastestFirst(sources?: StreamSource[]): StreamSource[] {
   if (!Array.isArray(sources) || sources.length <= 1) return sources || [];
   const score = (src: StreamSource) => {
+    const isEmbed =
+      src.type === 'embed' || /abyssplayer\.com|abysscdn\.com|myflix/i.test(`${src.url || ''} ${src.id || ''}`);
+    if (isEmbed) return 100;
     const isHevc = /\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${src.name} ${src.qualityLabel}`);
     const isBestHeavy = /best\s*quality/i.test(src.qualityLabel || '');
     let s = isHevc ? 200 : 1000;
     if (isBestHeavy) s -= 250;
-    if (src.type !== 'embed') s += 500;
     if (src.quality >= 360 && src.quality <= 576) s += 650;
     else if (src.quality === 720) s += 500;
     else if (src.quality === 1080) s += 350;
@@ -105,8 +107,8 @@ function sortEpisodeSourcesFastestFirst(sources?: StreamSource[]): StreamSource[
   return [...sources].sort((a, b) => score(b) - score(a));
 }
 
-function indexDetailsIntoMemory(detailsMap?: Record<string, MovieDetailData>): void {
-  if (!detailsMap) return;
+function indexDetailsIntoMemory(detailsMap?: Record<string, MovieDetailData>, isFromLiveApi = false): void {
+  if (!detailsMap || !isFromLiveApi) return;
   if (!loadedStaticDb) {
     loadedStaticDb = { generatedAt: Date.now(), catalogs: {}, details: {} };
   }
@@ -183,12 +185,12 @@ async function loadStaticDb(): Promise<StaticDbSnapshot | null> {
         if (!res.ok) return null;
         const parsed = (await res.json()) as StaticDbSnapshot;
         if (!loadedStaticDb) {
-          loadedStaticDb = parsed;
+          loadedStaticDb = { generatedAt: parsed.generatedAt || Date.now(), catalogs: parsed.catalogs || {}, details: {} };
         } else {
           loadedStaticDb.catalogs = parsed.catalogs || {};
         }
         if (parsed?.details) {
-          indexDetailsIntoMemory(parsed.details);
+          indexDetailsIntoMemory(parsed.details, false);
         }
         return loadedStaticDb;
       } catch {
@@ -507,7 +509,7 @@ export function prefetchMovieDetails(
               }
             }
             clientDetailCache.set(pathKey, { detail: json.detail, ts: Date.now() });
-            indexDetailsIntoMemory({ [pathKey]: json.detail });
+            indexDetailsIntoMemory({ [pathKey]: json.detail }, true);
             warmDetailFirstStream(json.detail, false);
           }
           return json;
@@ -1053,12 +1055,12 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
           }
           if (json.detail.url) {
             clientDetailCache.set(json.detail.url, { detail: json.detail, ts: Date.now() });
-            indexDetailsIntoMemory({ [json.detail.url]: json.detail });
+            indexDetailsIntoMemory({ [json.detail.url]: json.detail }, true);
           }
           warmDetailFirstStream(json.detail);
         } else if (pathname === '/api/catalog' && Array.isArray(json?.items) && json.items.length > 0) {
           if (json.prefetchedDetails && typeof json.prefetchedDetails === 'object') {
-            indexDetailsIntoMemory(json.prefetchedDetails);
+            indexDetailsIntoMemory(json.prefetchedDetails, true);
             for (const [detPath, detVal] of Object.entries(json.prefetchedDetails)) {
               if (detVal && (detVal as MovieDetailData).episodes?.length) {
                 clientDetailCache.set(detPath, {

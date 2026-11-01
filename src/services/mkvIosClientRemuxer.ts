@@ -1472,8 +1472,8 @@ export class IosMkvStreamController {
       }
 
       // ULTRA-FAST 1-REQUEST STARTUP (~160ms):
-      // Fetch 450 KB (header + Tracks + Cluster #0) in a SINGLE HTTP Range request!
-      const SINGLE_SHOT_BYTES = 450 * 1024;
+      // Fetch 680 KB (header + Tracks + Cluster #0-#1) in a SINGLE HTTP Range request for 8-12s initial cushion!
+      const SINGLE_SHOT_BYTES = 680 * 1024;
       const res = await fetch(this.url, {
         signal: this.abortController.signal,
         headers: {
@@ -1882,7 +1882,7 @@ export class IosMkvStreamController {
 
         if (!this.eofReached) {
           const rangeStart = this.nextByteOffset;
-          const desiredBytes = 2_200_000;
+          const desiredBytes = 3_600_000;
           let rangeEnd =
             this.totalFileBytes > 0
               ? Math.min(this.totalFileBytes - 1, rangeStart + desiredBytes - 1)
@@ -1891,8 +1891,8 @@ export class IosMkvStreamController {
           if (this.cuePoints.length >= 2) {
             const nextCue = this.cuePoints.find(
               (c) =>
-                c.byteOffset >= rangeStart + 1_350_000 &&
-                c.byteOffset <= rangeStart + desiredBytes + 1_000_000
+                c.byteOffset >= rangeStart + 2_200_000 &&
+                c.byteOffset <= rangeStart + desiredBytes + 1_400_000
             );
             if (nextCue) {
               rangeEnd = nextCue.byteOffset - 1;

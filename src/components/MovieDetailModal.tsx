@@ -29,8 +29,10 @@ import {
   RotateCcw,
   RotateCw,
   Search,
+  Settings,
   Share2,
   Smartphone,
+  Sparkles,
   Star,
   Subtitles,
   Sun,
@@ -163,6 +165,12 @@ function detectIdealQualityForNetwork(): { targetQuality: number; netLabel: stri
  */
 function pickBestSourceIndexForNet(sources: StreamSource[], autoNet: boolean): number {
   if (!sources || sources.length === 0) return 0;
+  // Always prioritize MyFlix / AbyssPlayer embed server first as default
+  const mfIdx = sources.findIndex(
+    (s) => s.type === 'embed' || /abyssplayer\.com|myflix|\/embed\//i.test(s.url || '')
+  );
+  if (mfIdx !== -1) return mfIdx;
+
   const isDirectStream = (s: StreamSource) =>
     s.type !== 'embed' && !/abyssplayer\.com|vidsrc|\/embed\//i.test(s.url || '');
   const isLightweightH264 = (s: StreamSource) =>
@@ -181,13 +189,13 @@ function pickBestSourceIndexForNet(sources: StreamSource[], autoNet: boolean): n
     return anyDirect !== -1 ? anyDirect : 0;
   }
 
-  // 1. ALWAYS prefer 480p (360p..576p) H.264 first for 0-delay instant start!
+  // 1. Prefer 480p (360p..576p) H.264 first if no MyFlix server is available
   const h480 = sources.findIndex(
     (s) => isLightweightH264(s) && s.quality >= 360 && s.quality <= 576
   );
   if (h480 !== -1) return h480;
 
-  // 2. Fallback to lightweight 720p H.264 (excluding multi-GB "Best Quality" files)
+  // 2. Fallback to lightweight 720p H.264
   const h720 = sources.findIndex((s) => isLightweightH264(s) && s.quality === 720);
   if (h720 !== -1) return h720;
 
@@ -195,7 +203,7 @@ function pickBestSourceIndexForNet(sources: StreamSource[], autoNet: boolean): n
   const anyLightH264 = sources.findIndex((s) => isLightweightH264(s));
   if (anyLightH264 !== -1) return anyLightH264;
 
-  // 4. Fallback to any direct stream before touching any embed
+  // 4. Fallback to any direct stream
   const anyDirectH264 = sources.findIndex((s) => isAnyDirectH264(s));
   if (anyDirectH264 !== -1) return anyDirectH264;
   const anyDirect = sources.findIndex((s) => isDirectStream(s));
@@ -376,7 +384,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const [isHold2x, setIsHold2x] = useState(false);
   const [videoFit, setVideoFit] = useState<'contain' | 'cover' | 'fill'>('contain');
   const [isScreenLocked, setIsScreenLocked] = useState(false);
-  const [showOverlayControls, setShowOverlayControls] = useState(true);
+  const [showOverlayControls, setShowOverlayControls] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isLandscapeMode, setIsLandscapeMode] = useState(false);
   const [isViewportPortrait, setIsViewportPortrait] = useState<boolean>(() =>
@@ -463,6 +471,8 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const standbyTimeoutRef = useRef<number | null>(null);
   const smoothPlaySecondsRef = useRef<number>(0);
   const hasStalledInSessionRef = useRef<boolean>(false);
+  const hasTriedBridgeFallbackRef = useRef<boolean>(false);
+  const hasUserManualServerRef = useRef<boolean>(false);
   const lastTapRef = useRef<{ time: number; side: 'left' | 'right' | 'center' }>({
     time: 0,
     side: 'center',
@@ -478,11 +488,21 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const lastRecordedSecondRef = useRef<number>(-1);
   const pendingResumeSecRef = useRef<number | null>(null);
   const hasAppliedIntroSkipRef = useRef<boolean>(false);
+  const pendingOsPipRef = useRef<boolean>(false);
+  const embedIframeRef = useRef<HTMLIFrameElement | null>(null);
+  const [isPortraitFullscreen, setIsPortraitFullscreen] = useState<boolean>(false);
+  const [isOsPipActive, setIsOsPipActive] = useState<boolean>(false);
 
   // Floating Mini-Player Position & Resizable Width State
   const [miniWidth, setMiniWidth] = useState<number>(250);
   const [miniPos, setMiniPos] = useState<{ x: number; y: number } | null>(null);
   const lastMiniTapTimeRef = useRef<number>(0);
+  const manualLandscapeLockRef = useRef<boolean>(false);
+  const autoTiltLandscapeRef = useRef<boolean>(false);
+  const wasViewportLandscapeRef = useRef<boolean>(false);
+  const tiltDebounceRef = useRef<number | null>(null);
+  const [selectedQualityPref, setSelectedQualityPref] = useState<'auto' | number>('auto');
+  const [showSeparateQualityBar, setShowSeparateQualityBar] = useState<boolean>(false);
   const miniDragRef = useRef<{
     mode: 'move' | 'resize' | 'pinch';
     startX: number;
@@ -589,23 +609,112 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     const updateOrientation = () => {
       const w = window.innerWidth || 390;
       const h = window.innerHeight || 844;
-      setIsViewportPortrait(h >= w);
+      const isPortraitNow = h >= w;
+      setIsViewportPortrait(isPortraitNow);
       setViewportDims({ width: w, height: h });
+
+      // Detect phone rotation to landscape via viewport ratio, screen.orientation, or window.orientation
+      const scrAngle =
+        typeof (window.screen?.orientation as any)?.angle === 'number'
+          ? (window.screen.orientation as any).angle
+          : typeof (window as any).orientation === 'number'
+            ? (window as any).orientation
+            : 0;
+      const scrType = String((window.screen?.orientation as any)?.type || '');
+      const isMobileLike = Math.min(w, h) <= 960 || 'ontouchstart' in window;
+      const isNowLandscape =
+        isMobileLike &&
+        (w > h * 1.05 ||
+          scrType.startsWith('landscape') ||
+          scrAngle === 90 ||
+          scrAngle === -90 ||
+          scrAngle === 270);
+
+      if (isNowLandscape && !wasViewportLandscapeRef.current) {
+        wasViewportLandscapeRef.current = true;
+        setIsPortraitFullscreen(false);
+        setIsLandscapeMode(true);
+        setIsFullscreen(true);
+      } else if (!isNowLandscape && wasViewportLandscapeRef.current) {
+        wasViewportLandscapeRef.current = false;
+        if (!manualLandscapeLockRef.current) {
+          setIsLandscapeMode(false);
+          setIsFullscreen(false);
+        }
+      }
     };
+
+    // Physical Phone Tilt Sensor (Gyroscope / Accelerometer) — Auto-enters Landscape even when phone OS Auto-Rotate is OFF
+    const onDeviceOrientation = (e: DeviceOrientationEvent) => {
+      const gamma = typeof e.gamma === 'number' ? e.gamma : 0; // Left/Right tilt (-90 to 90)
+      const beta = typeof e.beta === 'number' ? e.beta : 0; // Front/Back tilt (-180 to 180)
+      if (gamma === 0 && beta === 0) return;
+
+      // Tilted sideways horizontally (phone held in landscape position)
+      const isTiltedSideways = Math.abs(gamma) >= 48 && Math.abs(beta) <= 45;
+      // Held upright vertically (phone held in portrait position)
+      const isHeldUpright = Math.abs(beta) >= 48 && Math.abs(gamma) <= 25;
+
+      if (isTiltedSideways && !autoTiltLandscapeRef.current) {
+        if (tiltDebounceRef.current) window.clearTimeout(tiltDebounceRef.current);
+        tiltDebounceRef.current = window.setTimeout(() => {
+          autoTiltLandscapeRef.current = true;
+          setIsPortraitFullscreen(false);
+          setIsLandscapeMode(true);
+          setIsFullscreen(true);
+        }, 300);
+      } else if (isHeldUpright && autoTiltLandscapeRef.current && !manualLandscapeLockRef.current) {
+        if (tiltDebounceRef.current) window.clearTimeout(tiltDebounceRef.current);
+        tiltDebounceRef.current = window.setTimeout(() => {
+          autoTiltLandscapeRef.current = false;
+          if (!wasViewportLandscapeRef.current) {
+            setIsLandscapeMode(false);
+            setIsFullscreen(false);
+          }
+        }, 300);
+      }
+    };
+
     const onFsChange = () => {
       const fsActive = Boolean(
         document.fullscreenElement || (document as any).webkitFullscreenElement
       );
       setIsFullscreen(fsActive);
+      if (!fsActive && !wasViewportLandscapeRef.current && !autoTiltLandscapeRef.current) {
+        setIsLandscapeMode(false);
+      }
       updateOrientation();
     };
+
+    const mql = window.matchMedia ? window.matchMedia('(orientation: landscape)') : null;
+    const onMqlChange = () => updateOrientation();
+
     window.addEventListener('resize', updateOrientation);
     window.addEventListener('orientationchange', updateOrientation);
+    window.addEventListener('deviceorientation', onDeviceOrientation, true);
+    if (window.screen?.orientation) {
+      window.screen.orientation.addEventListener?.('change', updateOrientation);
+    }
+    if (mql?.addEventListener) {
+      mql.addEventListener('change', onMqlChange);
+    }
     document.addEventListener('fullscreenchange', onFsChange);
     document.addEventListener('webkitfullscreenchange', onFsChange);
+
+    // Run once on mount in case phone is already held in landscape
+    updateOrientation();
+
     return () => {
+      if (tiltDebounceRef.current) window.clearTimeout(tiltDebounceRef.current);
       window.removeEventListener('resize', updateOrientation);
       window.removeEventListener('orientationchange', updateOrientation);
+      window.removeEventListener('deviceorientation', onDeviceOrientation, true);
+      if (window.screen?.orientation) {
+        window.screen.orientation.removeEventListener?.('change', updateOrientation);
+      }
+      if (mql?.removeEventListener) {
+        mql.removeEventListener('change', onMqlChange);
+      }
       document.removeEventListener('fullscreenchange', onFsChange);
       document.removeEventListener('webkitfullscreenchange', onFsChange);
     };
@@ -668,6 +777,8 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setAutoMutedForiOS(false);
     smoothPlaySecondsRef.current = 0;
     hasStalledInSessionRef.current = false;
+    hasTriedBridgeFallbackRef.current = false;
+    hasUserManualServerRef.current = false;
     hasAppliedIntroSkipRef.current = false;
     pendingResumeSecRef.current = null;
     if (modalContainerRef.current) {
@@ -822,25 +933,23 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setShowSeasonDropdown(false);
     setShowAllScreenshots(false);
     setLightboxImage(null);
-    // Delay metadata enrichment so 100% of network & server priority goes to starting the video first!
-    const delayMs =
-      (detail?.episodes && detail.episodes.length > 0) ||
-      (instantDetailOnRender?.episodes && instantDetailOnRender.episodes.length > 0)
-        ? 2500
-        : 300;
-    const timer = window.setTimeout(() => {
-      if (cancelled) return;
-      universalApiFetch(`/api/myflix?title=${encodeURIComponent(movie.title)}`)
-        .then((res) => {
-          if (!cancelled && res && res.ok) {
-            setMyflixData(res);
+    universalApiFetch(`/api/myflix?title=${encodeURIComponent(movie.title)}`)
+      .then((res) => {
+        if (!cancelled && res && res.ok) {
+          setMyflixData(res);
+          if (
+            !hasUserManualServerRef.current &&
+            !hasStartedPlayback &&
+            ((res.embedServers && res.embedServers.length > 0) ||
+              (res.seasonsData && res.seasonsData.length > 0))
+          ) {
+            setSelectedSourceIdx(0);
           }
-        })
-        .catch(() => {});
-    }, delayMs);
+        }
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
     };
   }, [movie?.path, movie?.title]);
 
@@ -908,30 +1017,48 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const activeEpisode: EpisodeItem | undefined = episodes[selectedEpIdx] || episodes[0];
   const sources = useMemo<StreamSource[]>(() => {
     const rawList = activeEpisode?.sources ? [...activeEpisode.sources] : [];
-    // Filter out third-party embed iframes (abyssplayer.com etc.) whenever direct ad-free <video> streams exist,
-    // and sort so lightweight 480p H.264 is ALWAYS Server 1 (index 0), 720p is Server 2, and 1080p is Server 3!
     const directVideoSources = rawList.filter(
-      (s) => s.type !== 'embed' && !/abyssplayer\.com|vidsrc|\/embed\//i.test(s.url || '')
+      (s) => s.type !== 'embed' && !/abyssplayer\.com|abysscdn\.com|vidsrc|\/embed\//i.test(s.url || '')
     );
-    if (directVideoSources.length > 0) {
-      const score = (src: StreamSource) => {
-        const isHevc = /\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${src.name} ${src.qualityLabel}`);
-        const isBestHeavy = /best\s*quality/i.test(src.qualityLabel || '');
-        let sc = isHevc ? 200 : 1000;
-        if (isBestHeavy) sc -= 250;
-        if (src.quality >= 360 && src.quality <= 576) sc += 650;
-        else if (src.quality === 720) sc += 500;
-        else if (src.quality === 1080) sc += 350;
-        else sc += 150;
-        return sc;
-      };
-      return [...directVideoSources].sort((a, b) => score(b) - score(a));
+    const score = (src: StreamSource) => {
+      const isHevc = /\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${src.name} ${src.qualityLabel}`);
+      const isBestHeavy = /best\s*quality/i.test(src.qualityLabel || '');
+      let sc = isHevc ? 200 : 1000;
+      if (isBestHeavy) sc -= 250;
+      if (src.quality >= 360 && src.quality <= 576) sc += 650;
+      else if (src.quality === 720) sc += 500;
+      else if (src.quality === 1080) sc += 350;
+      else sc += 150;
+      return sc;
+    };
+
+    const sortedDirect = [...directVideoSources].sort((a, b) => score(b) - score(a));
+    const embedRaw = rawList.filter(
+      (s) => s.type === 'embed' || /abyssplayer\.com|abysscdn\.com|vidsrc|\/embed\//i.test(s.url || '')
+    );
+
+    // Put direct <video> streams FIRST so native HTML5 <video>, OS PiP, Quality Selector, and Gesture Controls work on every video!
+    const myflixFirst: StreamSource[] = [];
+    const seen = new Set<string>();
+
+    for (const [idx, d] of sortedDirect.entries()) {
+      if (d.url && !seen.has(d.url)) {
+        seen.add(d.url);
+        myflixFirst.push({
+          ...d,
+          name: idx === 0 ? 'MyFlix Server #1 (Default)' : d.name || `MyFlix Direct #${idx + 1} (${d.quality || 720}p)`,
+          provider: idx === 0 ? 'MyFlix Server #1 (Default)' : d.provider || `MyFlix Direct #${idx + 1}`,
+        });
+      }
     }
 
-    const base = [...rawList];
-    const seen = new Set(base.map((s) => s.url));
+    for (const e of embedRaw) {
+      if (e.url && !seen.has(e.url)) {
+        seen.add(e.url);
+        myflixFirst.push(e);
+      }
+    }
 
-    // Only fallback to MyFlixBD embed servers if no direct ad-free video streams exist
     if (myflixData?.seasonsData?.length) {
       const flatEpList = myflixData.seasonsData.flatMap((s) => s.episodes || []);
       const matchedMfEp =
@@ -941,14 +1068,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       for (const [idx, srv] of (matchedMfEp?.servers || []).entries()) {
         if (srv?.url && !seen.has(srv.url)) {
           seen.add(srv.url);
-          base.push({
+          myflixFirst.push({
             id: `myflix-ep-${idx}`,
-            name: srv.label || `Server ${idx + 1}`,
+            name: `MyFlix Turbo #${idx + 1}`,
             quality: 1080,
-            qualityLabel: '1080p',
+            qualityLabel: 'MyFlix HLS',
             audio: movie?.language || 'Multi Audio',
             audioLanguages: [movie?.language || 'Multi'],
-            provider: srv.label || `Server ${idx + 1}`,
+            provider: `MyFlix Turbo #${idx + 1}`,
             url: srv.url,
             downloadUrl: srv.url,
             type: 'embed',
@@ -961,14 +1088,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       myflixData.embedServers.forEach((srv, idx) => {
         if (srv.url && !seen.has(srv.url)) {
           seen.add(srv.url);
-          base.push({
+          myflixFirst.push({
             id: `myflix-${idx}`,
-            name: srv.label || `Server ${idx + 1}`,
+            name: `MyFlix Turbo #${idx + 1}`,
             quality: 1080,
-            qualityLabel: '1080p',
+            qualityLabel: 'MyFlix HLS',
             audio: movie?.language || 'Multi Audio',
             audioLanguages: [movie?.language || 'Multi'],
-            provider: srv.label || `Server ${idx + 1}`,
+            provider: `MyFlix Turbo #${idx + 1}`,
             url: srv.url,
             downloadUrl: srv.url,
             type: 'embed',
@@ -976,12 +1103,13 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         }
       });
     }
-    return base;
+
+    return myflixFirst;
   }, [activeEpisode?.sources, activeEpisode?.number, selectedEpIdx, myflixData?.seasonsData, myflixData?.embedServers, movie?.language]);
   const activeSource: StreamSource | undefined = sources[selectedSourceIdx] || sources[0];
   const isEmbedSource = Boolean(
     activeSource &&
-      (activeSource.type === 'embed' || /abyssplayer\.com|vidsrc|\/embed\//i.test(activeSource.url))
+      (activeSource.type === 'embed' || /abyssplayer\.com|abysscdn\.com|vidsrc|\/embed\//i.test(activeSource.url))
   );
 
   // Distinct seasons present inside episodes list (e.g. Season 1, Season 2... Season 20)
@@ -1268,19 +1396,11 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       })
       .catch(() => {
         if (iosControllerRef.current !== ctrl) return;
-        // Try next available H.264 stream source if current source fails
         const nextFailed = Array.from(new Set([...failedSourceIndices, selectedSourceIdx]));
         setFailedSourceIndices(nextFailed);
         const nextCandidateIdx = sources.findIndex((_, idx) => !nextFailed.includes(idx));
         if (nextCandidateIdx !== -1) {
           setSelectedSourceIdx(nextCandidateIdx);
-          return;
-        }
-        // If all sources are AV1/HEVC and device is Chrome/Android (non-WebKit), fall back to native <video> MKV playback!
-        if (!isAppleWebKitDevice()) {
-          setUseHlsBridge(false);
-          setFailedSourceIndices([]);
-          setSelectedSourceIdx(0);
           return;
         }
         setIsBuffering(false);
@@ -1304,6 +1424,111 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     }
     return rawUrl;
   }, [activeSource?.url, useHlsBridge, iosBlobUrl, isEmbedSource]);
+
+  // OS Phone-Screen Picture-in-Picture (PiP) & MediaSession Integration when leaving browser/app
+  useEffect(() => {
+    const v = videoRef.current as any;
+    if (!v) return;
+    try {
+      v.disablePictureInPicture = false;
+      v.autoPictureInPicture = true;
+    } catch {
+      // ignore
+    }
+    const onEnterPip = () => setIsOsPipActive(true);
+    const onLeavePip = () => setIsOsPipActive(false);
+    const onWebkitPresentationChange = () => {
+      if (v.webkitPresentationMode === 'picture-in-picture') {
+        setIsOsPipActive(true);
+      } else {
+        setIsOsPipActive(false);
+      }
+    };
+    v.addEventListener('enterpictureinpicture', onEnterPip);
+    v.addEventListener('leavepictureinpicture', onLeavePip);
+    v.addEventListener('webkitpresentationmodechanged', onWebkitPresentationChange);
+
+    if ('mediaSession' in navigator && movie) {
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: movie.title,
+          artist: 'CinePulse HD',
+          artwork: movie.poster ? [{ src: movie.poster, sizes: '512x512', type: 'image/jpeg' }] : [],
+        });
+        navigator.mediaSession.setActionHandler('play', () => {
+          v.play().catch(() => {});
+        });
+        navigator.mediaSession.setActionHandler('pause', () => {
+          v.pause();
+        });
+        // Enable Chrome / Android / iOS Safari automatic Picture-in-Picture when swiping to Home screen or switching tabs
+        (navigator.mediaSession as any).setActionHandler('enterpictureinpicture', () => {
+          try {
+            if (!document.pictureInPictureElement && v.requestPictureInPicture) {
+              v.requestPictureInPicture().catch(() => {});
+            } else if (v.webkitSupportsPresentationMode && v.webkitSetPresentationMode) {
+              v.webkitSetPresentationMode('picture-in-picture');
+            }
+          } catch {
+            // ignore
+          }
+        });
+      } catch {
+        // ignore
+      }
+    }
+
+    const triggerAutoPipOnExit = () => {
+      if (!v || v.paused || v.readyState < 1) return;
+      try {
+        v.disablePictureInPicture = false;
+        v.autoPictureInPicture = true;
+        v.setAttribute('autopictureinpicture', 'true');
+        if (!document.pictureInPictureElement && v.requestPictureInPicture) {
+          v.requestPictureInPicture().catch(() => {
+            if (onToggleMiniPlayer && !isMiniPlayer) {
+              onToggleMiniPlayer(true);
+            }
+          });
+        } else if (
+          v.webkitSupportsPresentationMode &&
+          v.webkitSetPresentationMode &&
+          v.webkitPresentationMode !== 'picture-in-picture'
+        ) {
+          v.webkitSetPresentationMode('picture-in-picture');
+        }
+      } catch {
+        if (onToggleMiniPlayer && !isMiniPlayer) {
+          onToggleMiniPlayer(true);
+        }
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        triggerAutoPipOnExit();
+      }
+    };
+
+    const onWindowBlur = () => {
+      if (document.visibilityState === 'hidden') {
+        triggerAutoPipOnExit();
+      }
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pagehide', triggerAutoPipOnExit);
+    window.addEventListener('blur', onWindowBlur);
+
+    return () => {
+      v.removeEventListener('enterpictureinpicture', onEnterPip);
+      v.removeEventListener('leavepictureinpicture', onLeavePip);
+      v.removeEventListener('webkitpresentationmodechanged', onWebkitPresentationChange);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pagehide', triggerAutoPipOnExit);
+      window.removeEventListener('blur', onWindowBlur);
+    };
+  }, [movie, effectiveVideoUrl, isEmbedSource, isMiniPlayer, onToggleMiniPlayer]);
 
   // Immediately trigger native video.play() inside useLayoutEffect (preserving user tap gesture!)
   // and only show buffering spinner if the stream takes > 600ms so instant streams never flash a spinner!
@@ -1620,6 +1845,8 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setBufferedEnd(0);
     smoothPlaySecondsRef.current = 0;
     hasStalledInSessionRef.current = false;
+    hasTriedBridgeFallbackRef.current = false;
+    hasUserManualServerRef.current = false;
     hasAppliedIntroSkipRef.current = false;
     pendingResumeSecRef.current = null;
     const src = ep?.sources?.[bestSrcIdx] || ep?.sources?.[0];
@@ -1634,6 +1861,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       pendingResumeSecRef.current = currentTime;
     }
     if (isManualChoice) {
+      hasUserManualServerRef.current = true;
       setAutoNetQuality(false);
       setStandbyUpgradeIdx(null);
     }
@@ -1645,12 +1873,6 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setVideoError(false);
     const src = sources[idx];
     onRecordWatchProgress(movie, activeEpisode, selectedEpIdx, src, currentTime);
-    triggerHud(
-      'toast',
-      isManualChoice
-        ? `⚡ সার্ভার সুইচ: ${src?.audioLanguages?.join('+') || src?.audio || 'Audio'} · ${src?.quality || 720}p চালু হয়েছে`
-        : `অটো কোয়ালিটি: ${src?.quality || 480}p চালু হয়েছে`
-    );
   };
 
   const handleEnableAutoQuality = () => {
@@ -1760,6 +1982,24 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     // Silence any upstream intro audio tag immediately before first frame plays
     syncCleanAudioVolume(v);
 
+    // If user requested OS Phone-Screen PiP while on an embed source and we switched to direct <video>, enter PiP now
+    if (pendingOsPipRef.current) {
+      pendingOsPipRef.current = false;
+      window.setTimeout(() => {
+        try {
+          const vidEl = videoRef.current as any;
+          if (!vidEl) return;
+          if (vidEl.requestPictureInPicture) {
+            vidEl.requestPictureInPicture().catch(() => {});
+          } else if (vidEl.webkitSupportsPresentationMode && vidEl.webkitSetPresentationMode) {
+            vidEl.webkitSetPresentationMode('picture-in-picture');
+          }
+        } catch {
+          // ignore
+        }
+      }, 250);
+    }
+
     if (useHlsBridge) {
       if (pendingResumeSecRef.current !== null && pendingResumeSecRef.current > 0.3) {
         const localOffset = pendingResumeSecRef.current;
@@ -1790,12 +2030,13 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       return;
     }
 
-    // 2. If user has saved watch history for this episode on initial open, resume ONCE automatically,
-    // and lock `hasAppliedIntroSkipRef.current = true` unconditionally so subsequent buffering/metadata events NEVER rewind!
-    const canResumeSaved =
+    const isInitialFreshStart =
       !hasAppliedIntroSkipRef.current &&
       currentTime < 3 &&
-      lastRecordedSecondRef.current < 3 &&
+      lastRecordedSecondRef.current < 3;
+
+    const canResumeSaved =
+      isInitialFreshStart &&
       savedProgress &&
       (savedProgress.episodeIdx === undefined || savedProgress.episodeIdx === selectedEpIdx) &&
       savedProgress.progressSeconds &&
@@ -1819,6 +2060,17 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       return;
     }
 
+    // Automatically skip the 0s..13.5s upstream intro watermark on fresh playback so the user jumps straight into the movie!
+    if (isInitialFreshStart && introSkipSec > 0 && (!v.duration || v.duration > introSkipSec + 30)) {
+      try {
+        v.currentTime = introSkipSec;
+        lastRecordedSecondRef.current = Math.floor(introSkipSec);
+        setCurrentTime(Math.floor(introSkipSec));
+      } catch {
+        // ignore
+      }
+    }
+
     isSeekingRef.current = false;
     syncCleanAudioVolume(v);
     startVideoWithiOSFallback(v);
@@ -1826,7 +2078,6 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
   const handleVideoError = () => {
     const resumeAt = Math.max(currentTime, lastRecordedSecondRef.current);
-    // 1. Automatically fall back to next available H.264 stream (e.g. 720p or 480p) if current source fails
     const nextFailed = Array.from(new Set([...failedSourceIndices, selectedSourceIdx]));
     setFailedSourceIndices(nextFailed);
 
@@ -1840,8 +2091,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       return;
     }
 
-    // 2. If direct native MKV playback failed on all sources, switch to our client-side MP4 remux engine!
-    if (!useHlsBridge) {
+    // Only attempt client-side MP4 remux bridge ONCE per episode if native playback failed
+    if (!useHlsBridge && !hasTriedBridgeFallbackRef.current) {
+      hasTriedBridgeFallbackRef.current = true;
       if (resumeAt > 3) {
         pendingResumeSecRef.current = resumeAt;
       }
@@ -1911,29 +2163,178 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     );
   };
 
-  const handleTogglePiP = async () => {
-    // Prefer In-App Floating Mini Player so the user can browse the app while watching!
-    if (onToggleMiniPlayer && !isLandscapeMode && !isFullscreen) {
-      onToggleMiniPlayer(!isMiniPlayer);
+  // Dedicated Quality Selection Helper (Switches resolution while preserving playback time)
+  const directQualitySources = (() => {
+    const seenQ = new Map<number, { idx: number; source: StreamSource }>();
+    sources.forEach((s, idx) => {
+      const isEmb =
+        s.type === 'embed' || /abyssplayer\.com|abysscdn\.com|vidsrc|\/embed\//i.test(s.url || '');
+      if (!isEmb && s.quality) {
+        if (!seenQ.has(s.quality)) {
+          seenQ.set(s.quality, { idx, source: s });
+        }
+      }
+    });
+    return Array.from(seenQ.entries())
+      .sort((a, b) => b[0] - a[0])
+      .map(([quality, item]) => ({
+        quality,
+        idx: item.idx,
+        source: item.source,
+        label:
+          quality >= 1080
+            ? '1080p Full HD'
+            : quality >= 720
+              ? '720p HD'
+              : quality >= 480
+                ? '480p SD'
+                : `${quality}p`,
+      }));
+  })();
+
+  const activeQualityLabel =
+    selectedQualityPref === 'auto'
+      ? activeSource?.quality
+        ? `Auto (${activeSource.quality}p)`
+        : 'Auto HD'
+      : `${selectedQualityPref}p`;
+
+  const handleSelectQualityOption = (pref: 'auto' | number, targetIdx?: number) => {
+    setSelectedQualityPref(pref);
+    setShowQualityMenu(false);
+    setShowSeparateQualityBar(false);
+    if (pref === 'auto') {
+      setAutoNetQuality(true);
+      if (sources.length > 0 && selectedSourceIdx !== 0) {
+        handleSelectSource(0, true);
+      }
       return;
     }
+    setAutoNetQuality(false);
+    if (typeof targetIdx === 'number' && targetIdx >= 0 && targetIdx < sources.length) {
+      handleSelectSource(targetIdx, true);
+      return;
+    }
+    // Find best matching source for requested quality
+    const exactIdx = sources.findIndex(
+      (s) =>
+        s.quality === pref &&
+        s.type !== 'embed' &&
+        !/abyssplayer\.com|abysscdn\.com|vidsrc|\/embed\//i.test(s.url || '')
+    );
+    if (exactIdx !== -1) {
+      handleSelectSource(exactIdx, true);
+    } else {
+      const fallbackIdx = sources.findIndex((s) => s.quality === pref);
+      if (fallbackIdx !== -1) {
+        handleSelectSource(fallbackIdx, true);
+      }
+    }
+  };
+
+  // OS Phone-Screen Picture-in-Picture (PiP) + In-App Mini-Screen Handler
+  const handleTogglePiP = async () => {
     const v = videoRef.current as any;
-    if (!v) return;
+
+    // If Mini-Player is already active, restore to full modal
+    if (isMiniPlayer && onToggleMiniPlayer) {
+      onToggleMiniPlayer(false);
+      return;
+    }
+
+    // If currently on an iframe embed, switch to direct <video> stream and activate Mini-Player / OS PiP
+    if (isEmbedSource) {
+      const directIdx = sources.findIndex(
+        (s) => s.type !== 'embed' && !/abyssplayer\.com|vidsrc|\/embed\//i.test(s.url || '')
+      );
+      if (directIdx !== -1) {
+        pendingOsPipRef.current = true;
+        handleSelectSource(directIdx, true);
+      }
+      if (onToggleMiniPlayer) {
+        onToggleMiniPlayer(!isMiniPlayer);
+      }
+      return;
+    }
+
+    if (v) {
+      try {
+        v.disablePictureInPicture = false;
+        v.autoPictureInPicture = true;
+        v.setAttribute('autopictureinpicture', 'true');
+
+        if (document.pictureInPictureElement) {
+          await document.exitPictureInPicture();
+          setIsOsPipActive(false);
+          return;
+        }
+        if (v.webkitPresentationMode === 'picture-in-picture' && v.webkitSetPresentationMode) {
+          v.webkitSetPresentationMode('inline');
+          setIsOsPipActive(false);
+          return;
+        }
+        // Ensure video has started before requesting OS PiP
+        if (v.paused && v.readyState >= 1) {
+          await v.play().catch(() => {});
+        }
+        if (v.requestPictureInPicture && v.readyState >= 1) {
+          await v.requestPictureInPicture();
+          setIsOsPipActive(true);
+          return;
+        }
+        if (
+          v.webkitSupportsPresentationMode &&
+          v.webkitSetPresentationMode &&
+          v.webkitSupportsPresentationMode('picture-in-picture')
+        ) {
+          v.webkitSetPresentationMode('picture-in-picture');
+          setIsOsPipActive(true);
+          return;
+        }
+      } catch {
+        // If OS PiP is restricted by embedded preview iframe or webview, immediately activate Floating Mini-Screen PiP!
+      }
+    }
+
+    if (onToggleMiniPlayer) {
+      onToggleMiniPlayer(!isMiniPlayer);
+    }
+  };
+
+  // Portrait Fullscreen Mode Toggle (Vertical Full-Screen on Phone)
+  const handleTogglePortraitMode = () => {
+    manualLandscapeLockRef.current = false;
+    autoTiltLandscapeRef.current = false;
+    if (isMiniPlayer && onToggleMiniPlayer) {
+      onToggleMiniPlayer(false);
+    }
+    if (isPortraitFullscreen) {
+      setIsPortraitFullscreen(false);
+      return;
+    }
+    // Exit Landscape if active and switch to Portrait Fullscreen
+    setIsLandscapeMode(false);
+    setIsFullscreen(false);
     try {
-      if (document.pictureInPictureElement) {
-        await document.exitPictureInPicture();
-      } else if (v.requestPictureInPicture) {
-        await v.requestPictureInPicture();
-      } else if (v.webkitSupportsPresentationMode && v.webkitSetPresentationMode) {
-        v.webkitSetPresentationMode(
-          v.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture'
-        );
+      const currentFs = document.fullscreenElement || (document as any).webkitFullscreenElement;
+      if (currentFs) {
+        if (document.exitFullscreen) {
+          document.exitFullscreen().catch(() => {});
+        } else if ((document as any).webkitExitFullscreen) {
+          (document as any).webkitExitFullscreen();
+        }
+      }
+      if ((screen.orientation as any)?.unlock) {
+        (screen.orientation as any).unlock();
       }
     } catch {
       // ignore
     }
+    setIsPortraitFullscreen(true);
+    resetOverlayAutoHide();
   };
 
+  // Landscape Fullscreen Mode Toggle (True 90-deg Rotation on Portrait Phones + Native Fullscreen)
   const handleToggleFullscreen = () => {
     const stage = playerStageRef.current as any;
     const currentFs = document.fullscreenElement || (document as any).webkitFullscreenElement;
@@ -1945,8 +2346,11 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setViewportDims({ width: w, height: h });
 
     if (currentlyActive) {
+      manualLandscapeLockRef.current = false;
+      autoTiltLandscapeRef.current = false;
       setIsLandscapeMode(false);
       setIsFullscreen(false);
+      setIsPortraitFullscreen(false);
       try {
         if (currentFs) {
           if (document.exitFullscreen) {
@@ -1964,9 +2368,11 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       return;
     }
 
+    manualLandscapeLockRef.current = true;
     if (isMiniPlayer && onToggleMiniPlayer) {
       onToggleMiniPlayer(false);
     }
+    setIsPortraitFullscreen(false);
 
     // Activate Fullscreen + 90-deg Landscape Rotation Mode immediately
     if (modalContainerRef.current) {
@@ -1990,11 +2396,48 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         stage.webkitRequestFullscreen();
       }
     } catch {
-      // CSS 90deg landscape rotation on the inner stage wrapper handles portrait screens automatically
+      // CSS 90deg landscape rotation on #player-container-0 handles portrait screens automatically
     }
   };
 
-  // Touch Gesture Handlers on Video Stage (Left vertical swipe = Brightness, Right vertical swipe = Volume, Double tap = +-10s, Long press = 2x Speed)
+  const applyVolumeLevel = (nextV: number) => {
+    const clamped = Math.max(0, Math.min(100, Math.round(nextV)));
+    setVolume(clamped);
+    setIsMuted(clamped === 0);
+    if (videoRef.current) {
+      videoRef.current.volume = clamped / 100;
+      videoRef.current.muted = clamped === 0;
+    }
+    if (embedIframeRef.current?.contentWindow) {
+      try {
+        embedIframeRef.current.contentWindow.postMessage(
+          JSON.stringify({ context: 'player.js', method: 'setVolume', value: clamped }),
+          '*'
+        );
+      } catch {
+        // ignore
+      }
+    }
+    triggerHud('volume', clamped === 0 ? 'Muted (0%)' : `Sound ${clamped}%`, clamped, 850);
+  };
+
+  const applyBrightnessLevel = (nextB: number) => {
+    const clamped = Math.max(20, Math.min(160, Math.round(nextB)));
+    setBrightness(clamped);
+    try {
+      localStorage.setItem(BRIGHTNESS_STORAGE_KEY, String(clamped));
+    } catch {
+      // ignore
+    }
+    triggerHud(
+      'brightness',
+      `Brightness ${clamped}%`,
+      Math.round(((clamped - 20) / 140) * 100),
+      850
+    );
+  };
+
+  // Touch Gesture Handlers on Video Stage (Left vertical swipe = Sound, Right vertical swipe = Brightness, Double tap = +-10s, Long press = 2x Speed)
   const handleStageTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     if (isMiniPlayer || isScreenLocked || playerMode === 'trailer') return;
     if ((e.target as HTMLElement).closest('button, input, select, a, [data-scrubber="true"]')) return;
@@ -2052,30 +2495,11 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     if (g.side === 'right') {
       // Right side swipe up/down -> Brightness increase/decrease (20% to 160%)
       const deltaBrightness = Math.round(dy * 0.75);
-      const nextB = Math.max(20, Math.min(160, g.startVal + deltaBrightness));
-      setBrightness(nextB);
-      try {
-        localStorage.setItem(BRIGHTNESS_STORAGE_KEY, String(nextB));
-      } catch {
-        // ignore
-      }
-      triggerHud(
-        'brightness',
-        `Brightness ${nextB}%`,
-        Math.round(((nextB - 20) / 140) * 100),
-        650
-      );
+      applyBrightnessLevel(g.startVal + deltaBrightness);
     } else {
       // Left side swipe up/down -> Sound / Volume increase/decrease (0% to 100%)
       const deltaVol = Math.round(dy * 0.65);
-      const nextV = Math.max(0, Math.min(100, g.startVal + deltaVol));
-      setVolume(nextV);
-      setIsMuted(nextV === 0);
-      if (videoRef.current) {
-        videoRef.current.volume = nextV / 100;
-        videoRef.current.muted = nextV === 0;
-      }
-      triggerHud('volume', nextV === 0 ? 'Muted' : `Sound ${nextV}%`, nextV, 650);
+      applyVolumeLevel(g.startVal + deltaVol);
     }
   };
 
@@ -2629,16 +3053,12 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       className={
         isMiniPlayer
           ? 'fixed z-50 rounded-2xl overflow-hidden shadow-[0_18px_48px_rgba(0,0,0,0.92)] border border-[#dc2626]/60 bg-[#050505] text-[#e5e5e5] flex flex-col cursor-grab active:cursor-grabbing select-none'
-          : `fixed inset-0 z-50 w-full max-w-[100vw] bg-[#050505] text-[#e5e5e5] flex flex-col ${
-              isLandscapeMode || isFullscreen
-                ? 'overflow-hidden'
-                : 'overflow-y-auto overflow-x-hidden overscroll-y-contain'
-            }`
+          : 'fixed inset-0 z-50 w-full h-[100dvh] max-w-[100vw] bg-[#050505] text-[#e5e5e5] flex flex-col overflow-hidden'
       }
     >
-      {/* Top Clean MyFlixBD-Style Navbar (Hidden in Mini Player or Fullscreen) */}
-      {!isMiniPlayer && !isLandscapeMode && !isFullscreen && (
-        <header className="sticky top-0 z-40 w-full bg-[#0a0a0a]/95 backdrop-blur-md border-b border-white/[0.08]">
+      {/* Top Clean MyFlixBD-Style Navbar (Locked at Top; Hidden in Mini Player or Fullscreen) */}
+      {!isMiniPlayer && !isLandscapeMode && !isFullscreen && !isPortraitFullscreen && (
+        <header className="shrink-0 relative z-40 w-full bg-[#0a0a0a]/95 backdrop-blur-md border-b border-white/[0.08]">
           <div className="max-w-5xl mx-auto px-3 sm:px-6 h-13 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2.5 min-w-0">
               <button
@@ -2663,67 +3083,260 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               </button>
             </div>
 
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
               <button
                 type="button"
                 onClick={() => onToggleWatchlist(movie, currentFolder)}
-                className={`h-8 px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
+                className={`h-8 px-2.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
                   isInWatchlist
                     ? 'bg-[#dc2626]/20 border-[#dc2626] text-white'
                     : 'bg-[#151515] hover:bg-[#222222] border-white/[0.08] text-gray-200'
                 }`}
               >
                 <ListPlus className="w-3.5 h-3.5 text-[#dc2626]" />
-                <span className="hidden xs:inline">{isInWatchlist ? 'Saved' : 'Watchlist'}</span>
+                <span className="hidden sm:inline">{isInWatchlist ? 'Saved' : 'Watchlist'}</span>
               </button>
 
               <button
                 type="button"
                 onClick={handleShare}
-                className="h-8 px-3 rounded-lg bg-[#151515] hover:bg-[#222222] border border-white/[0.08] text-xs font-semibold text-gray-200 flex items-center gap-1.5 transition-colors"
+                className="h-8 px-2.5 rounded-lg bg-[#151515] hover:bg-[#222222] border border-white/[0.08] text-xs font-semibold text-gray-200 flex items-center gap-1.5 transition-colors"
               >
                 {copiedShare ? (
                   <>
                     <Check className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Copied</span>
+                    <span className="hidden sm:inline">Copied</span>
                   </>
                 ) : (
                   <>
                     <Share2 className="w-3.5 h-3.5 text-[#dc2626]" />
-                    <span className="hidden xs:inline">Share</span>
+                    <span className="hidden sm:inline">Share</span>
                   </>
                 )}
               </button>
 
-              {onToggleMiniPlayer && (
+              {/* Settings Icon (⚙️) ONLY in Top Header Bar — Never on Video Play Screen */}
+              <div className="relative">
                 <button
                   type="button"
-                  onClick={() => onToggleMiniPlayer(true)}
-                  title="Mini Player"
-                  className="w-8 h-8 rounded-lg bg-[#151515] hover:bg-[#222222] border border-white/[0.08] text-gray-200 flex items-center justify-center transition-colors"
+                  onClick={() => setShowAudioServerMenu((v) => !v)}
+                  title="Server, Sound, Brightness & View Settings"
+                  className={`h-8 px-2.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                    showAudioServerMenu
+                      ? 'bg-[#dc2626] border-[#dc2626] text-white'
+                      : 'bg-[#151515] hover:bg-[#222222] border-white/[0.08] text-gray-200'
+                  }`}
                 >
-                  <Minimize2 className="w-4 h-4" />
+                  <Settings className="w-3.5 h-3.5 text-current" />
+                  <span className="hidden xs:inline">Settings</span>
                 </button>
-              )}
+
+                {showAudioServerMenu && (
+                  <div
+                    onClick={(e) => e.stopPropagation()}
+                    className="absolute right-0 top-full mt-2 w-72 max-h-[78dvh] overflow-y-auto rounded-xl bg-[#111318]/98 border border-white/15 shadow-2xl p-3 z-50 divide-y divide-white/10"
+                  >
+                    {/* 1. Manual Server Selection */}
+                    <div className="pb-2.5">
+                      <div className="px-1 py-0.5 text-[11px] font-extrabold uppercase tracking-wider text-gray-300 flex items-center justify-between">
+                        <span>Select Server (ম্যানুয়াল সার্ভার)</span>
+                        <button
+                          type="button"
+                          onClick={() => setShowAudioServerMenu(false)}
+                          className="text-gray-400 hover:text-white cursor-pointer"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                      <div className="space-y-1 mt-1.5">
+                        {sources.map((src, idx) => {
+                          const isActive = selectedSourceIdx === idx;
+                          const isMf =
+                            idx === 0 ||
+                            src.type === 'embed' ||
+                            /abyssplayer|abysscdn|myflix/i.test(`${src.url || ''} ${src.id || ''}`);
+                          const label =
+                            idx === 0
+                              ? 'MyFlix Server #1 (Default)'
+                              : isMf
+                                ? `MyFlix Server #${idx + 1}`
+                                : `Cloud Server (Manual • ${src.quality || 720}p)`;
+                          return (
+                            <button
+                              key={src.id || idx}
+                              type="button"
+                              onClick={() => handleSelectSource(idx, true)}
+                              className={`w-full text-left px-2.5 py-2 rounded-lg text-xs font-bold flex items-center justify-between transition-colors cursor-pointer ${
+                                isActive
+                                  ? 'bg-[#dc2626] text-white'
+                                  : 'bg-white/[0.05] hover:bg-white/[0.12] text-gray-200'
+                              }`}
+                            >
+                              <span className="truncate">{label}</span>
+                              {isActive && <Check className="w-3.5 h-3.5 shrink-0 ml-1.5" />}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* 2. Sound (Volume) & Brightness Controls */}
+                    <div className="py-2.5 space-y-2.5">
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-xs font-semibold text-gray-200">
+                          <span className="flex items-center gap-1.5">
+                            {isMuted || volume === 0 ? (
+                              <VolumeX className="w-3.5 h-3.5 text-red-400" />
+                            ) : (
+                              <Volume2 className="w-3.5 h-3.5 text-[#dc2626]" />
+                            )}
+                            <span>Sound (সাউন্ড)</span>
+                          </span>
+                          <span className="font-mono text-[11px] text-gray-300">
+                            {isMuted ? 0 : volume}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={100}
+                          value={isMuted ? 0 : volume}
+                          onChange={(e) => applyVolumeLevel(Number(e.target.value))}
+                          className="w-full h-1.5 bg-white/20 rounded-lg accent-[#dc2626] cursor-pointer"
+                        />
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-xs font-semibold text-gray-200">
+                          <span className="flex items-center gap-1.5">
+                            <Sun className="w-3.5 h-3.5 text-amber-400" />
+                            <span>Brightness (ব্রাইটনেস)</span>
+                          </span>
+                          <span className="font-mono text-[11px] text-gray-300">{brightness}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={20}
+                          max={160}
+                          value={brightness}
+                          onChange={(e) => applyBrightnessLevel(Number(e.target.value))}
+                          className="w-full h-1.5 bg-white/20 rounded-lg accent-amber-400 cursor-pointer"
+                        />
+                      </div>
+                    </div>
+
+                    {/* 3. Portrait Mode, Landscape Mode & Phone PiP Mode */}
+                    <div className="py-2.5 space-y-1.5">
+                      <div className="text-[10px] font-extrabold uppercase tracking-wider text-gray-400">
+                        Screen & PiP Mode
+                      </div>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowAudioServerMenu(false);
+                            handleTogglePortraitMode();
+                          }}
+                          className="px-2 py-2 rounded-lg bg-white/[0.06] hover:bg-white/[0.14] text-[11px] font-bold text-gray-100 flex flex-col items-center gap-1 cursor-pointer"
+                        >
+                          <Smartphone className="w-4 h-4 text-[#dc2626]" />
+                          <span>Portrait</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowAudioServerMenu(false);
+                            handleToggleFullscreen();
+                          }}
+                          className="px-2 py-2 rounded-lg bg-white/[0.06] hover:bg-white/[0.14] text-[11px] font-bold text-gray-100 flex flex-col items-center gap-1 cursor-pointer"
+                        >
+                          <Maximize className="w-4 h-4 text-[#dc2626]" />
+                          <span>Landscape</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowAudioServerMenu(false);
+                            handleTogglePiP();
+                          }}
+                          className="px-2 py-2 rounded-lg bg-white/[0.06] hover:bg-white/[0.14] text-[11px] font-bold text-gray-100 flex flex-col items-center gap-1 cursor-pointer"
+                        >
+                          <PictureInPicture2 className="w-4 h-4 text-[#dc2626]" />
+                          <span>PiP Mode</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* 4. Subtitle & Playback Speed */}
+                    <div className="pt-2 space-y-1">
+                      <button
+                        type="button"
+                        onClick={() => setAutoBanglaSubEnabled((v) => !v)}
+                        className="w-full text-left px-2 py-1.5 rounded-lg text-xs font-semibold text-gray-200 hover:bg-white/10 flex items-center justify-between cursor-pointer"
+                      >
+                        <span>বাংলা Subtitle</span>
+                        <span
+                          className={
+                            autoBanglaSubEnabled ? 'text-emerald-400 font-bold' : 'text-gray-400'
+                          }
+                        >
+                          {autoBanglaSubEnabled ? 'ON' : 'OFF'}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setPlaybackSpeed((s) =>
+                            s === 1 ? 1.25 : s === 1.25 ? 1.5 : s === 1.5 ? 2 : 1
+                          )
+                        }
+                        className="w-full text-left px-2 py-1.5 rounded-lg text-xs font-semibold text-gray-200 hover:bg-white/10 flex items-center justify-between cursor-pointer"
+                      >
+                        <span>Playback Speed</span>
+                        <span className="text-[#ef4444] font-bold">{playbackSpeed}x</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <button
+                type="button"
+                onClick={handleTogglePiP}
+                title="Phone Screen PiP Mode"
+                className={`w-8 h-8 rounded-lg border flex items-center justify-center transition-colors cursor-pointer ${
+                  isOsPipActive
+                    ? 'bg-[#dc2626] border-[#dc2626] text-white'
+                    : 'bg-[#151515] hover:bg-[#222222] border-white/[0.08] text-gray-200'
+                }`}
+              >
+                <PictureInPicture2 className="w-4 h-4" />
+              </button>
             </div>
           </div>
         </header>
       )}
 
-      {/* Main MyFlixBD Container (Sections 1, 2, 3, 4, 5) */}
+      {/* Main MyFlixBD Container — Video Pinned at Top (shrink-0), Lower Page Scrolls Independently */}
       <div
         className={
           isMiniPlayer
             ? 'w-full'
-            : isLandscapeMode || isFullscreen
+            : isLandscapeMode || isFullscreen || isPortraitFullscreen
               ? 'w-full h-full'
-              : 'w-full max-w-5xl mx-auto px-2.5 sm:px-6 pt-3 pb-28 flex flex-col gap-5'
+              : 'flex-1 min-h-0 w-full max-w-5xl mx-auto flex flex-col overflow-hidden'
         }
       >
         {/* =====================================================================
-            SECTION 1: CLEAN 16:9 VIDEO CONTAINER (NO LONG-PRESS CONTEXT MENU, NO EMBEDDED TEXT)
+            SECTION 1: PINNED 16:9 VIDEO CONTAINER (NEVER SCROLLS OUT OF VIEW, NO SETTINGS ICON ON VIDEO)
            ===================================================================== */}
-        <section className="w-full">
+        <section
+          className={
+            isMiniPlayer || isLandscapeMode || isFullscreen || isPortraitFullscreen
+              ? 'w-full shrink-0'
+              : 'w-full shrink-0 px-2.5 sm:px-6 pt-2 pb-1.5 bg-[#050505] z-30'
+          }
+        >
           <div className="bg-[#0a0a0a] border border-white/[0.08] rounded-xl overflow-hidden shadow-2xl">
             {/* #player-container-0 — Zero-Overhead 16:9 Hardware Video Container + Left Sound / Right Brightness Finger Swipe */}
             <div
@@ -2741,15 +3354,58 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 WebkitTouchCallout: 'none',
                 WebkitUserSelect: 'none',
                 userSelect: 'none',
+                ...(isLandscapeMode && isViewportPortrait
+                  ? {
+                      position: 'fixed',
+                      top: '50%',
+                      left: '50%',
+                      width: '100dvh',
+                      height: '100dvw',
+                      transform: 'translate(-50%, -50%) rotate(90deg)',
+                      zIndex: 9999,
+                    }
+                  : {}),
               }}
               className={
                 isMiniPlayer
                   ? 'relative w-full aspect-video bg-black select-none'
-                  : isLandscapeMode || isFullscreen
-                    ? 'fixed inset-0 z-[9999] w-screen h-screen bg-black flex items-center justify-center select-none touch-none'
-                    : 'relative w-full aspect-video bg-black overflow-hidden select-none'
+                  : isLandscapeMode && isViewportPortrait
+                    ? 'bg-black flex items-center justify-center select-none touch-none overflow-hidden'
+                    : isLandscapeMode || isFullscreen || isPortraitFullscreen
+                      ? 'fixed inset-0 z-[9999] w-screen h-[100dvh] bg-black flex items-center justify-center select-none touch-none overflow-hidden'
+                      : 'relative w-full aspect-video bg-black overflow-hidden select-none'
               }
             >
+              {/* On-Screen Volume (Left Swipe) & Brightness (Right Swipe) Visual Gesture HUD */}
+              {!isMiniPlayer && hudNotice && (
+                <div className="pointer-events-none absolute top-3.5 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-full bg-black/85 border border-white/20 backdrop-blur-md shadow-2xl flex items-center gap-2.5 min-w-[170px]">
+                  {hudNotice.type === 'volume' ? (
+                    isMuted || (hudNotice.percent ?? volume) === 0 ? (
+                      <VolumeX className="w-4 h-4 text-red-400 shrink-0" />
+                    ) : (
+                      <Volume2 className="w-4 h-4 text-[#dc2626] shrink-0" />
+                    )
+                  ) : (
+                    <Sun className="w-4 h-4 text-amber-400 shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[11px] font-extrabold text-white tracking-wide truncate">
+                      {hudNotice.label}
+                    </div>
+                    {typeof hudNotice.percent === 'number' && (
+                      <div className="w-full h-1.5 bg-white/20 rounded-full overflow-hidden mt-1">
+                        <div
+                          style={{ width: `${Math.max(0, Math.min(100, hudNotice.percent))}%` }}
+                          className={`h-full rounded-full transition-all duration-75 ${
+                            hudNotice.type === 'volume' ? 'bg-[#dc2626]' : 'bg-amber-400'
+                          }`}
+                        />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
               {/* Mini-Player Quick Controls */}
               {isMiniPlayer && (
                 <div className="pointer-events-none absolute inset-0 z-30 flex flex-col justify-between">
@@ -2781,16 +3437,59 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 </div>
               )}
 
-              {/* Exit Fullscreen Button when in custom Landscape / Fullscreen */}
-              {!isMiniPlayer && (isLandscapeMode || isFullscreen) && (
-                <button
-                  type="button"
-                  onClick={handleToggleFullscreen}
-                  className="absolute top-3 left-3 z-40 px-3 py-1.5 rounded-lg bg-black/75 border border-white/20 text-white text-xs font-bold flex items-center gap-1.5"
+              {/* Top Control Bar when in Portrait Fullscreen or Landscape Fullscreen */}
+              {!isMiniPlayer && (isLandscapeMode || isFullscreen || isPortraitFullscreen) && (
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  className="absolute top-3 inset-x-3 z-40 flex items-center justify-between gap-2 pointer-events-none"
                 >
-                  <ChevronLeft className="w-4 h-4" />
-                  <span>Exit Fullscreen</span>
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isPortraitFullscreen) {
+                        setIsPortraitFullscreen(false);
+                      } else {
+                        handleToggleFullscreen();
+                      }
+                    }}
+                    className="pointer-events-auto px-3 py-1.5 rounded-lg bg-black/75 border border-white/20 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                    <span>Exit</span>
+                  </button>
+
+                  <div className="pointer-events-auto flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (isPortraitFullscreen) {
+                          handleToggleFullscreen();
+                        } else {
+                          handleTogglePortraitMode();
+                        }
+                      }}
+                      className="px-2.5 py-1.5 rounded-lg bg-black/75 border border-white/20 text-white text-xs font-bold flex items-center gap-1 cursor-pointer"
+                    >
+                      <Smartphone className="w-3.5 h-3.5 text-[#dc2626]" />
+                      <span>{isPortraitFullscreen ? 'Landscape' : 'Portrait'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCycleVideoFit}
+                      className="px-2.5 py-1.5 rounded-lg bg-black/75 border border-white/20 text-white text-xs font-bold cursor-pointer"
+                    >
+                      {videoFit === 'contain' ? 'Fit' : videoFit === 'cover' ? 'Zoom' : 'Stretch'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleTogglePiP}
+                      className="px-2.5 py-1.5 rounded-lg bg-black/75 border border-white/20 text-white text-xs font-bold flex items-center gap-1 cursor-pointer"
+                    >
+                      <PictureInPicture2 className="w-3.5 h-3.5 text-[#dc2626]" />
+                      <span>PiP</span>
+                    </button>
+                  </div>
+                </div>
               )}
 
               {/* Hold 2x Speed Indicator */}
@@ -2829,21 +3528,48 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   allowFullScreen
                 />
               ) : isEmbedSource && activeSource?.url ? (
-                <iframe
-                  key={activeSource.url}
-                  src={activeSource.url}
-                  title={effectiveDetail?.title || movie.title}
-                  sandbox="allow-scripts allow-same-origin allow-presentation"
-                  referrerPolicy="no-referrer"
-                  style={{ filter: `brightness(${brightness}%)` }}
-                  className="w-full h-full border-0 bg-black"
-                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen"
-                  allowFullScreen
-                />
+                <div className="relative w-full h-full">
+                  <iframe
+                    ref={embedIframeRef}
+                    key={activeSource.url}
+                    src={activeSource.url}
+                    title={effectiveDetail?.title || movie.title}
+                    sandbox="allow-scripts allow-same-origin allow-presentation"
+                    referrerPolicy="no-referrer"
+                    style={{ filter: `brightness(${brightness}%)` }}
+                    className="w-full h-full border-0 bg-black"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen"
+                    allowFullScreen
+                  />
+                  {/* Left & Right Vertical Swipe Gesture Zones for Sound (Left) & Brightness (Right) on Embed Player */}
+                  {!isMiniPlayer && (
+                    <>
+                      <div
+                        onTouchStart={handleStageTouchStart}
+                        onTouchMove={handleStageTouchMove}
+                        onTouchEnd={handleStageTouchEnd}
+                        className="absolute inset-y-12 left-0 w-[18%] z-20 touch-none"
+                      />
+                      <div
+                        onTouchStart={handleStageTouchStart}
+                        onTouchMove={handleStageTouchMove}
+                        onTouchEnd={handleStageTouchEnd}
+                        className="absolute inset-y-12 right-0 w-[18%] z-20 touch-none"
+                      />
+                    </>
+                  )}
+                </div>
               ) : effectiveVideoUrl && !videoError ? (
                 <>
                   <video
-                    ref={videoRef}
+                    ref={(el) => {
+                      videoRef.current = el;
+                      if (el) {
+                        el.disablePictureInPicture = false;
+                        (el as any).autoPictureInPicture = true;
+                        el.setAttribute('autopictureinpicture', 'true');
+                      }
+                    }}
                     src={effectiveVideoUrl}
                     poster={movie.poster || effectiveDetail?.poster}
                     style={{
@@ -2853,18 +3579,20 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                       userSelect: 'none',
                     }}
                     muted={isMuted}
-                    controls={!isMiniPlayer}
+                    controls={false}
                     playsInline
                     autoPlay
                     preload="auto"
-                    disablePictureInPicture
-                    controlsList="nodownload nofullscreen noremoteplayback"
+                    controlsList="nodownload"
                     onContextMenu={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
                     }}
                     onPlay={(e) => {
                       const v = e.currentTarget;
+                      v.disablePictureInPicture = false;
+                      (v as any).autoPictureInPicture = true;
+                      v.setAttribute('autopictureinpicture', 'true');
                       setIsPlaying(true);
                       syncCleanAudioVolume(v);
                       try {
@@ -2873,6 +3601,11 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                         }
                       } catch {
                         // ignore
+                      }
+                    }}
+                    onPause={() => {
+                      if (!isSeekingRef.current && !iosTransitioningRef.current) {
+                        setIsPlaying(false);
                       }
                     }}
                     onPlaying={(e) => {
@@ -3021,8 +3754,8 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                       }
                       const segDur = v.duration || 0;
                       if (useHlsBridge && iosControllerRef.current && segDur > 0) {
-                        // Trigger next segment pre-buffer early (when < 11s left) AND prime hardware decoder
-                        if (segDur - v.currentTime < 11) {
+                        // Trigger next segment pre-buffer early (when < 14s left) AND prime hardware decoder
+                        if (segDur - v.currentTime < 14) {
                           const nextSegIdx = iosCurrentSegIndexRef.current + 1;
                           iosControllerRef.current
                             .ensureNextSegmentPrebuffered(nextSegIdx, 0)
@@ -3087,14 +3820,276 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     onError={handleVideoError}
                     className="w-full h-full bg-black object-contain select-none"
                   />
-                  {/* Zero-Black-Screen Poster & Buffering Shield until First Video Frame is Decoded */}
+
+                  {/* MyFlix Clean JWPlayer-Style Dark Overlay (Only shown when user taps screen or pauses) */}
+                  {!isMiniPlayer && hasStartedPlayback && (showOverlayControls || !isPlaying) && (
+                    <div
+                      onClick={() => setShowOverlayControls(false)}
+                      className="absolute inset-0 z-30 flex flex-col justify-end bg-gradient-to-t from-black/80 via-transparent to-transparent select-none"
+                    >
+                      {/* Center Minimal MyFlix Transport Icons: [-10s] [Play/Pause] [+10s] */}
+                      <div className="flex items-center justify-center gap-8 sm:gap-12 my-auto">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleSeekRelative(-10);
+                          }}
+                          className="w-10 h-10 rounded-full bg-black/50 hover:bg-black/75 border border-white/15 flex items-center justify-center text-white active:scale-90 transition-transform cursor-pointer"
+                        >
+                          <RotateCcw className="w-5 h-5" />
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleTogglePlayPause();
+                          }}
+                          className="w-12 h-12 rounded-full bg-black/65 hover:bg-black/85 border border-white/25 text-white flex items-center justify-center shadow-lg active:scale-90 transition-transform cursor-pointer"
+                        >
+                          {isBuffering ? (
+                            <Loader2 className="w-6 h-6 animate-spin text-sky-400" />
+                          ) : isPlaying ? (
+                            <Pause className="w-6 h-6 fill-current" />
+                          ) : (
+                            <Play className="w-6 h-6 fill-current ml-0.5" />
+                          )}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleSeekRelative(10);
+                          }}
+                          className="w-10 h-10 rounded-full bg-black/50 hover:bg-black/75 border border-white/15 flex items-center justify-center text-white active:scale-90 transition-transform cursor-pointer"
+                        >
+                          <RotateCw className="w-5 h-5" />
+                        </button>
+                      </div>
+
+                      {/* Bottom Full-Duration Scrubber & Controls */}
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="px-3 pb-2.5 pt-1 space-y-1.5"
+                      >
+                        {/* Interactive Full-Movie Scrubber Bar */}
+                        <div
+                          ref={scrubberRef}
+                          data-scrubber="true"
+                          onTouchStart={(e) => {
+                            e.stopPropagation();
+                            const t = e.touches[0];
+                            if (!t) return;
+                            isScrubbingRef.current = true;
+                            setIsScrubbing(true);
+                            previewScrubberAtPointer(t.clientX, t.clientY, e.currentTarget);
+                          }}
+                          onTouchMove={(e) => {
+                            e.stopPropagation();
+                            if (!isScrubbingRef.current) return;
+                            const t = e.touches[0];
+                            if (!t) return;
+                            previewScrubberAtPointer(t.clientX, t.clientY, e.currentTarget);
+                          }}
+                          onTouchEnd={(e) => {
+                            e.stopPropagation();
+                            if (!isScrubbingRef.current) return;
+                            isScrubbingRef.current = false;
+                            setIsScrubbing(false);
+                            setScrubPreview(null);
+                            commitScrubberSeek(scrubTargetSecRef.current);
+                          }}
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            const el = e.currentTarget;
+                            isScrubbingRef.current = true;
+                            setIsScrubbing(true);
+                            previewScrubberAtPointer(e.clientX, e.clientY, el);
+                            const onMove = (ev: MouseEvent) => {
+                              if (!isScrubbingRef.current) return;
+                              previewScrubberAtPointer(ev.clientX, ev.clientY, el);
+                            };
+                            const onUp = (ev: MouseEvent) => {
+                              window.removeEventListener('mousemove', onMove);
+                              window.removeEventListener('mouseup', onUp);
+                              if (!isScrubbingRef.current) return;
+                              isScrubbingRef.current = false;
+                              setIsScrubbing(false);
+                              setScrubPreview(null);
+                              const { targetSec } = computeScrubberTarget(ev.clientX, ev.clientY, el);
+                              commitScrubberSeek(targetSec);
+                            };
+                            window.addEventListener('mousemove', onMove);
+                            window.addEventListener('mouseup', onUp);
+                          }}
+                          className="relative h-5 flex items-center cursor-pointer touch-none"
+                        >
+                          <div className="w-full h-1.5 rounded-full bg-white/25 overflow-hidden relative">
+                            <div
+                              style={{ width: `${bufferedPercent}%` }}
+                              className="absolute inset-y-0 left-0 bg-white/40 rounded-full transition-all duration-150"
+                            />
+                            <div
+                              style={{ width: `${progressPercent}%` }}
+                              className="absolute inset-y-0 left-0 bg-[#dc2626] rounded-full"
+                            />
+                          </div>
+                          <div
+                            style={{ left: `calc(${progressPercent}% - 7px)` }}
+                            className="absolute w-3.5 h-3.5 rounded-full bg-[#dc2626] border-2 border-white shadow-md pointer-events-none"
+                          />
+                        </div>
+
+                        {/* Time & Right Action Buttons */}
+                        <div className="flex items-center justify-between text-[11px] sm:text-xs font-mono text-gray-200">
+                          <div className="flex items-center gap-2.5">
+                            <button
+                              type="button"
+                              onClick={handleTogglePlayPause}
+                              className="text-white hover:text-[#dc2626] cursor-pointer"
+                            >
+                              {isPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleToggleMute}
+                              className="text-white hover:text-[#dc2626] cursor-pointer"
+                            >
+                              {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4" />}
+                            </button>
+                            <span>
+                              {formatSeconds(activePlayheadSec)} / {formatSeconds(displayDuration)}
+                            </span>
+                          </div>
+
+                          <div className="relative flex items-center gap-1.5 sm:gap-2">
+                            {/* Dedicated Quality Selector Button Inside Player Control Bar */}
+                            <div className="relative">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setShowQualityMenu((v) => !v);
+                                }}
+                                title="Select Video Quality"
+                                className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold border cursor-pointer flex items-center gap-1 ${
+                                  showQualityMenu
+                                    ? 'bg-[#dc2626] border-[#dc2626] text-white'
+                                    : 'bg-black/65 border-white/25 text-white hover:border-white/50'
+                                }`}
+                              >
+                                <Sparkles className="w-2.5 h-2.5 text-[#dc2626]" />
+                                <span>{activeQualityLabel}</span>
+                              </button>
+
+                              {showQualityMenu && (
+                                <div
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="absolute right-0 bottom-full mb-2 w-40 rounded-xl bg-[#111318]/95 border border-white/15 shadow-2xl p-1.5 z-50 backdrop-blur-md"
+                                >
+                                  <div className="px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-gray-400 border-b border-white/10 mb-1">
+                                    Video Quality
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSelectQualityOption('auto')}
+                                    className={`w-full px-2.5 py-1.5 rounded-lg text-left text-[11px] font-semibold flex items-center justify-between cursor-pointer ${
+                                      selectedQualityPref === 'auto'
+                                        ? 'bg-[#dc2626] text-white'
+                                        : 'text-gray-200 hover:bg-white/10'
+                                    }`}
+                                  >
+                                    <span>Auto (Recommended)</span>
+                                    {selectedQualityPref === 'auto' && <Check className="w-3.5 h-3.5" />}
+                                  </button>
+                                  {(directQualitySources.length > 0
+                                    ? directQualitySources
+                                    : [
+                                        { quality: 1080, idx: -1, label: '1080p Full HD' },
+                                        { quality: 720, idx: -1, label: '720p HD' },
+                                        { quality: 480, idx: -1, label: '480p SD' },
+                                      ]
+                                  ).map((qItem) => (
+                                    <button
+                                      key={qItem.quality}
+                                      type="button"
+                                      onClick={() =>
+                                        handleSelectQualityOption(
+                                          qItem.quality,
+                                          qItem.idx >= 0 ? qItem.idx : undefined
+                                        )
+                                      }
+                                      className={`w-full px-2.5 py-1.5 rounded-lg text-left text-[11px] font-semibold flex items-center justify-between cursor-pointer mt-0.5 ${
+                                        selectedQualityPref === qItem.quality
+                                          ? 'bg-[#dc2626] text-white'
+                                          : 'text-gray-200 hover:bg-white/10'
+                                      }`}
+                                    >
+                                      <span>{qItem.label}</span>
+                                      {selectedQualityPref === qItem.quality && (
+                                        <Check className="w-3.5 h-3.5" />
+                                      )}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => setAutoBanglaSubEnabled((v) => !v)}
+                              className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold border cursor-pointer ${
+                                autoBanglaSubEnabled
+                                  ? 'bg-[#dc2626] border-[#dc2626] text-white'
+                                  : 'bg-black/60 border-white/20 text-gray-200'
+                              }`}
+                            >
+                              বাংলা Sub
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleTogglePortraitMode}
+                              title="Portrait Fullscreen Mode"
+                              className="p-1 rounded hover:bg-white/10 text-white cursor-pointer"
+                            >
+                              <Smartphone className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleTogglePiP}
+                              title="OS Phone-Screen PiP / Mini-Screen Mode"
+                              className="p-1 rounded hover:bg-white/10 text-white cursor-pointer"
+                            >
+                              <PictureInPicture2 className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleToggleFullscreen}
+                              title="Landscape Fullscreen Mode"
+                              className="p-1 rounded hover:bg-white/10 text-white cursor-pointer"
+                            >
+                              {isLandscapeMode || isFullscreen ? (
+                                <Minimize className="w-4 h-4" />
+                              ) : (
+                                <Maximize className="w-4 h-4" />
+                              )}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Steady Poster & Buffering Shield until First Video Frame is Decoded */}
                   {!hasStartedPlayback && (
                     <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black">
                       {(movie.poster || effectiveDetail?.poster) && (
                         <img
                           src={movie.poster || effectiveDetail?.poster}
                           alt={movie.title}
-                          className="absolute inset-0 w-full h-full object-contain opacity-65"
+                          className="absolute inset-0 w-full h-full object-cover opacity-35 blur-xs"
                         />
                       )}
                       <div className="relative z-10 flex flex-col items-center gap-2 px-4 py-2 rounded-xl bg-black/65 backdrop-blur-xs">
@@ -3128,7 +4123,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                           videoRef.current.play().catch(() => {});
                         }
                       }}
-                      className="absolute top-3 right-3 z-30 px-3 py-1.5 rounded-lg bg-[#dc2626] text-white text-xs font-bold flex items-center gap-1.5 shadow-xl"
+                      className="absolute top-3 left-3 z-30 px-3 py-1.5 rounded-lg bg-[#dc2626] text-white text-xs font-bold flex items-center gap-1.5 shadow-xl"
                     >
                       <Volume2 className="w-4 h-4" />
                       <span>Tap for Sound</span>
@@ -3141,17 +4136,19 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   activeSource?.url &&
                   !effectiveVideoUrl &&
                   !videoError) ? (
-                <div className="relative w-full h-full flex items-center justify-center bg-black">
+                <div className="pointer-events-none relative w-full h-full flex items-center justify-center bg-black">
                   {(movie.poster || effectiveDetail?.poster) && (
                     <img
                       src={movie.poster || effectiveDetail?.poster}
                       alt={movie.title}
-                      className="absolute inset-0 w-full h-full object-cover opacity-35 blur-xs pointer-events-none"
+                      className="absolute inset-0 w-full h-full object-cover opacity-35 blur-xs"
                     />
                   )}
-                  <div className="relative z-10 flex flex-col items-center gap-2">
-                    <Loader2 className="w-8 h-8 animate-spin text-[#dc2626]" />
-                    <span className="text-xs font-medium text-gray-300">Loading Stream...</span>
+                  <div className="relative z-10 flex flex-col items-center gap-2 px-4 py-2 rounded-xl bg-black/65 backdrop-blur-xs">
+                    <Loader2 className="w-7 h-7 animate-spin text-[#dc2626]" />
+                    <span className="text-[11px] font-semibold text-white tracking-wide">
+                      Starting Stream...
+                    </span>
                   </div>
                 </div>
               ) : (
@@ -3187,7 +4184,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
               {/* Single Small Bangla Subtitle at the Bottom of the Video Screen (Only when manually turned ON) */}
               {!isMiniPlayer && autoBanglaSubEnabled && activeBanglaCueText && (
-                <div className="pointer-events-none select-none absolute inset-x-2 bottom-2 sm:bottom-3 z-30 flex justify-center">
+                <div className="pointer-events-none select-none absolute inset-x-2 bottom-12 sm:bottom-14 z-30 flex justify-center">
                   <div
                     className="max-w-[90%] px-2 py-0.5 rounded bg-black/55 text-center font-medium text-white text-[11px] sm:text-xs leading-tight tracking-wide"
                     style={{
@@ -3205,10 +4202,10 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         </section>
 
         {/* =====================================================================
-            LOWER UI SECTION — EXACT MATCH TO USER SCREENSHOT 1
+            LOWER UI SECTION — SCROLLS INDEPENDENTLY WHILE VIDEO REMAINS LOCKED AT TOP
            ===================================================================== */}
-        {!isMiniPlayer && !isLandscapeMode && !isFullscreen && (
-          <div className="px-1 sm:px-2 space-y-5">
+        {!isMiniPlayer && !isLandscapeMode && !isFullscreen && !isPortraitFullscreen && (
+          <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden overscroll-y-contain px-2.5 sm:px-6 pt-2 pb-28 space-y-5">
             {/* 1. Title + "Info >" + Single-Line Metadata + Horizontal Action Pills */}
             <section className="space-y-2.5">
               {/* Title + Inline "Info >" */}
@@ -3246,12 +4243,12 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 <span>{distinctSeasons.length || 1} seasons</span>
               </div>
 
-              {/* Horizontal Action Pills: [ Add to list ] [ Share ] [ Download ] [ Video / Sub ] */}
-              <div className="flex items-center gap-2.5 overflow-x-auto no-scrollbar pt-1">
+              {/* Horizontal Action Pills: [ Add to list ] [ Share ] [ Download ] [ Landscape ] [ Portrait ] [ PiP ] [ Video / Sub ] */}
+              <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pt-1">
                 <button
                   type="button"
                   onClick={() => onToggleWatchlist(movie, currentFolder)}
-                  className={`h-10 px-4 rounded-full text-xs sm:text-sm font-medium flex items-center gap-2 shrink-0 transition-colors cursor-pointer ${
+                  className={`h-9 px-3.5 rounded-full text-xs sm:text-sm font-medium flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer ${
                     isInWatchlist
                       ? 'bg-[#dc2626]/25 border border-[#dc2626] text-white'
                       : 'bg-[#1b1d21] hover:bg-[#25282e] text-gray-200'
@@ -3264,7 +4261,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 <button
                   type="button"
                   onClick={handleShare}
-                  className="h-10 px-4 rounded-full bg-[#1b1d21] hover:bg-[#25282e] text-xs sm:text-sm font-medium text-gray-200 flex items-center gap-2 shrink-0 transition-colors cursor-pointer"
+                  className="h-9 px-3.5 rounded-full bg-[#1b1d21] hover:bg-[#25282e] text-xs sm:text-sm font-medium text-gray-200 flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer"
                 >
                   {copiedShare ? (
                     <>
@@ -3282,10 +4279,59 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 <button
                   type="button"
                   onClick={() => setShowDownloadSheet(true)}
-                  className="h-10 px-4 rounded-full bg-[#1b1d21] hover:bg-[#25282e] text-xs sm:text-sm font-medium text-gray-200 flex items-center gap-2 shrink-0 transition-colors cursor-pointer"
+                  className="h-9 px-3.5 rounded-full bg-[#1b1d21] hover:bg-[#25282e] text-xs sm:text-sm font-medium text-gray-200 flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer"
                 >
                   <Download className="w-4 h-4" />
                   <span>Download</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowSeparateQualityBar((v) => !v)}
+                  className={`h-9 px-3.5 rounded-full text-xs sm:text-sm font-medium flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer ${
+                    showSeparateQualityBar || selectedQualityPref !== 'auto'
+                      ? 'bg-[#dc2626]/25 border border-[#dc2626] text-white'
+                      : 'bg-[#1b1d21] hover:bg-[#25282e] text-gray-200'
+                  }`}
+                >
+                  <Sparkles className="w-4 h-4 text-[#dc2626]" />
+                  <span>Quality: {activeQualityLabel}</span>
+                  <ChevronDown
+                    className={`w-3.5 h-3.5 transition-transform ${
+                      showSeparateQualityBar ? 'rotate-180' : ''
+                    }`}
+                  />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleToggleFullscreen}
+                  className="h-9 px-3.5 rounded-full bg-[#1b1d21] hover:bg-[#25282e] text-xs sm:text-sm font-medium text-gray-200 flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer"
+                >
+                  <Maximize className="w-4 h-4 text-[#dc2626]" />
+                  <span>Landscape</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleTogglePortraitMode}
+                  className="h-9 px-3.5 rounded-full bg-[#1b1d21] hover:bg-[#25282e] text-xs sm:text-sm font-medium text-gray-200 flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer"
+                >
+                  <Smartphone className="w-4 h-4 text-[#dc2626]" />
+                  <span>Portrait</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleTogglePiP}
+                  className={`h-9 px-3.5 rounded-full text-xs sm:text-sm font-medium flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer ${
+                    isOsPipActive || isMiniPlayer
+                      ? 'bg-[#dc2626]/25 border border-[#dc2626] text-white'
+                      : 'bg-[#1b1d21] hover:bg-[#25282e] text-gray-200'
+                  }`}
+                >
+                  <PictureInPicture2 className="w-4 h-4 text-[#dc2626]" />
+                  <span>PiP / Mini</span>
                 </button>
 
                 <input
@@ -3298,7 +4344,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 <button
                   type="button"
                   onClick={() => setAutoBanglaSubEnabled((v) => !v)}
-                  className={`h-10 px-4 rounded-full text-xs sm:text-sm font-medium flex items-center gap-2 shrink-0 transition-colors cursor-pointer ${
+                  className={`h-9 px-3.5 rounded-full text-xs sm:text-sm font-medium flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer ${
                     autoBanglaSubEnabled
                       ? 'bg-[#dc2626]/25 border border-[#dc2626] text-white'
                       : 'bg-[#1b1d21] hover:bg-[#25282e] text-gray-200'
@@ -3308,6 +4354,53 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   <span>{autoBanglaSubEnabled ? 'Bangla Sub: ON' : 'Video / Sub'}</span>
                 </button>
               </div>
+
+              {/* Separate Dedicated Quality Selection Bar (Opens when tapping Quality pill) */}
+              {showSeparateQualityBar && (
+                <div className="mt-2 p-2.5 rounded-xl bg-[#14161b] border border-white/15 flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-bold text-gray-300 mr-1 flex items-center gap-1">
+                    <Sparkles className="w-3.5 h-3.5 text-[#dc2626]" />
+                    <span>Select Quality:</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectQualityOption('auto')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                      selectedQualityPref === 'auto'
+                        ? 'bg-[#dc2626] text-white shadow-md'
+                        : 'bg-[#1f2229] text-gray-300 hover:bg-[#2a2e37]'
+                    }`}
+                  >
+                    Auto ({activeSource?.quality || 720}p)
+                  </button>
+                  {(directQualitySources.length > 0
+                    ? directQualitySources
+                    : [
+                        { quality: 1080, idx: -1, label: '1080p Full HD' },
+                        { quality: 720, idx: -1, label: '720p HD' },
+                        { quality: 480, idx: -1, label: '480p SD' },
+                      ]
+                  ).map((qItem) => (
+                    <button
+                      key={qItem.quality}
+                      type="button"
+                      onClick={() =>
+                        handleSelectQualityOption(
+                          qItem.quality,
+                          qItem.idx >= 0 ? qItem.idx : undefined
+                        )
+                      }
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                        selectedQualityPref === qItem.quality
+                          ? 'bg-[#dc2626] text-white shadow-md'
+                          : 'bg-[#1f2229] text-gray-300 hover:bg-[#2a2e37]'
+                      }`}
+                    >
+                      {qItem.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </section>
 
             {/* 2. Resources Section: Header + Audio/Server Dropdown + [ All ] [ 01 ] [ 02 ] [ 03 ] Episode Tiles */}
@@ -3321,129 +4414,93 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 <HelpCircle className="w-4 h-4 text-gray-400 shrink-0" />
               </div>
 
-              {/* Audio / Server / Season Dropdown Box ([ Hindi dub ⌄ ]) */}
-              <div className="relative inline-block">
-                <button
-                  type="button"
-                  onClick={() => setShowSeasonDropdown((v) => !v)}
-                  className="h-10 px-3.5 rounded-lg bg-[#121418] hover:bg-[#1b1d21] border border-white/15 text-xs sm:text-sm font-medium text-gray-100 flex items-center gap-2.5 transition-colors cursor-pointer"
-                >
-                  <span>
-                    {effectiveDetail?.language || movie.language}
-                    {sources.length > 1
-                      ? ` · Server ${selectedSourceIdx + 1} (${activeSource?.quality || 720}p)`
-                      : distinctSeasons.length > 1
-                        ? ` · ${activeSeasonLabel}`
-                        : ' dub'}
-                  </span>
-                  <ChevronDown
-                    className={`w-4 h-4 text-gray-400 transition-transform ${
-                      showSeasonDropdown ? 'rotate-180' : ''
-                    }`}
-                  />
-                </button>
+              {/* Audio / Season Dropdown Box (No Server Name Below Player) */}
+              {(distinctSeasons.length > 1 || (effectiveDetail?.relatedSeasons || []).length > 0) && (
+                <div className="relative inline-block">
+                  <button
+                    type="button"
+                    onClick={() => setShowSeasonDropdown((v) => !v)}
+                    className="h-10 px-3.5 rounded-lg bg-[#121418] hover:bg-[#1b1d21] border border-white/15 text-xs sm:text-sm font-medium text-gray-100 flex items-center gap-2.5 transition-colors cursor-pointer"
+                  >
+                    <span>
+                      {effectiveDetail?.language || movie.language} · {activeSeasonLabel}
+                    </span>
+                    <ChevronDown
+                      className={`w-4 h-4 text-gray-400 transition-transform ${
+                        showSeasonDropdown ? 'rotate-180' : ''
+                      }`}
+                    />
+                  </button>
 
-                {showSeasonDropdown && (
-                  <div className="absolute left-0 top-full mt-1.5 min-w-[230px] max-h-72 overflow-y-auto bg-[#121418] border border-white/15 rounded-xl shadow-2xl z-30 py-1.5 divide-y divide-white/10">
-                    {/* Server / Resolution Options */}
-                    {sources.length > 0 && (
-                      <div className="py-1">
-                        <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-gray-400">
-                          Stream Servers
-                        </div>
-                        {sources.map((src, idx) => {
-                          const isActive = selectedSourceIdx === idx;
-                          return (
-                            <button
-                              key={src.id || idx}
-                              type="button"
-                              onClick={() => {
-                                handleSelectSource(idx, true);
-                                setShowSeasonDropdown(false);
-                              }}
-                              className={`w-full text-left px-3 py-2 text-xs font-semibold flex items-center justify-between transition-colors ${
-                                isActive
-                                  ? 'bg-[#dc2626]/20 text-[#ef4444]'
-                                  : 'text-gray-200 hover:bg-white/5'
-                              }`}
-                            >
-                              <span>
-                                Server {idx + 1} · {src.audio || movie.language} ({src.quality || 720}p)
-                              </span>
-                              {isActive && <Check className="w-3.5 h-3.5 text-[#ef4444]" />}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-
-                    {/* Season Options if Multi-Season */}
-                    {distinctSeasons.length > 1 && (
-                      <div className="py-1">
-                        <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-gray-400">
-                          Seasons
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSelectedSeasonFilter('all');
-                            setShowSeasonDropdown(false);
-                          }}
-                          className={`w-full text-left px-3 py-2 text-xs font-semibold ${
-                            selectedSeasonFilter === 'all'
-                              ? 'bg-[#dc2626]/20 text-[#ef4444]'
-                              : 'text-gray-200 hover:bg-white/5'
-                          }`}
-                        >
-                          All Seasons ({episodes.length})
-                        </button>
-                        {distinctSeasons.map((sNum) => (
+                  {showSeasonDropdown && (
+                    <div className="absolute left-0 top-full mt-1.5 min-w-[200px] max-h-72 overflow-y-auto bg-[#121418] border border-white/15 rounded-xl shadow-2xl z-30 py-1.5 divide-y divide-white/10">
+                      {distinctSeasons.length > 1 && (
+                        <div className="py-1">
+                          <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-gray-400">
+                            Seasons
+                          </div>
                           <button
-                            key={sNum}
                             type="button"
                             onClick={() => {
-                              setSelectedSeasonFilter(sNum);
+                              setSelectedSeasonFilter('all');
                               setShowSeasonDropdown(false);
                             }}
                             className={`w-full text-left px-3 py-2 text-xs font-semibold ${
-                              selectedSeasonFilter === sNum
+                              selectedSeasonFilter === 'all'
                                 ? 'bg-[#dc2626]/20 text-[#ef4444]'
                                 : 'text-gray-200 hover:bg-white/5'
                             }`}
                           >
-                            Season {String(sNum).padStart(2, '0')}
+                            All Seasons ({episodes.length})
                           </button>
-                        ))}
-                      </div>
-                    )}
-
-                    {/* Related Season Packs */}
-                    {(effectiveDetail?.relatedSeasons || []).length > 0 && (
-                      <div className="py-1">
-                        <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-gray-400">
-                          More Seasons
-                        </div>
-                        {(effectiveDetail?.relatedSeasons || []).map((relSeason) => {
-                          const normS = normalizeMovieCardItem(relSeason);
-                          return (
+                          {distinctSeasons.map((sNum) => (
                             <button
-                              key={relSeason.path}
+                              key={sNum}
                               type="button"
                               onClick={() => {
+                                setSelectedSeasonFilter(sNum);
                                 setShowSeasonDropdown(false);
-                                onSelectMovie(normS);
                               }}
-                              className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-white/5 truncate"
+                              className={`w-full text-left px-3 py-2 text-xs font-semibold ${
+                                selectedSeasonFilter === sNum
+                                  ? 'bg-[#dc2626]/20 text-[#ef4444]'
+                                  : 'text-gray-200 hover:bg-white/5'
+                              }`}
                             >
-                              {normS.episodePill || normS.title}
+                              Season {String(sNum).padStart(2, '0')}
                             </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Related Season Packs */}
+                      {(effectiveDetail?.relatedSeasons || []).length > 0 && (
+                        <div className="py-1">
+                          <div className="px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-gray-400">
+                            More Seasons
+                          </div>
+                          {(effectiveDetail?.relatedSeasons || []).map((relSeason) => {
+                            const normS = normalizeMovieCardItem(relSeason);
+                            return (
+                              <button
+                                key={relSeason.path}
+                                type="button"
+                                onClick={() => {
+                                  setShowSeasonDropdown(false);
+                                  onSelectMovie(normS);
+                                }}
+                                className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-white/5 truncate"
+                              >
+                                {normS.episodePill || normS.title}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Horizontal Episode Tiles Row: [ All ] [ 01 ] [ 02 ] [ 03 ] [ 04 ] [ 05 ] [ 06 ] ... */}
               <div className="flex items-center gap-2.5 overflow-x-auto no-scrollbar py-0.5">

@@ -71,11 +71,13 @@ let healthCache: CacheEntry<ServerNodeStatus[]> | null = null;
 function sortSourcesFastestFirst(sources?: StreamSource[]): StreamSource[] {
   if (!Array.isArray(sources) || sources.length <= 1) return sources || [];
   const score = (src: StreamSource) => {
+    const isMyFlixEmbed =
+      src.type === 'embed' || /abyssplayer\.com|myflix/i.test(`${src.url || ''} ${src.id || ''}`);
+    if (isMyFlixEmbed) return 5000;
     const isHevc = /\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${src.name} ${src.qualityLabel}`);
     const isBestHeavy = /best\s*quality/i.test(src.qualityLabel || '');
     let s = isHevc ? 200 : 1000;
     if (isBestHeavy) s -= 250;
-    if (src.type !== 'embed') s += 500;
     if (src.quality >= 360 && src.quality <= 576) s += 650;
     else if (src.quality === 720) s += 500;
     else if (src.quality === 1080) s += 350;
@@ -1173,40 +1175,7 @@ async function startServer() {
             }
           }
         }
-        if (parsed?.details) {
-          for (const [itemPath, det] of Object.entries(parsed.details)) {
-            if (det && typeof det === 'object') {
-              storeDetailInCaches(itemPath, det as MovieDetailData, detailTtl);
-            }
-          }
-        }
-      }
-
-      // Also preload all 16 pre-decrypted shard-*.json files into detailCache & detailTitleCache
-      const shardsDir = path.join(__dirname, 'public', 'db-shards');
-      if (fs.existsSync(shardsDir)) {
-        for (let i = 0; i < 16; i++) {
-          const hex = i.toString(16);
-          const shardPath = path.join(shardsDir, `shard-${hex}.json`);
-          if (!fs.existsSync(shardPath)) continue;
-          try {
-            const rawShard = await fs.promises.readFile(shardPath, 'utf8');
-            const shardObj = JSON.parse(rawShard);
-            const detailsMap =
-              shardObj?.details && typeof shardObj.details === 'object'
-                ? shardObj.details
-                : shardObj;
-            if (detailsMap && typeof detailsMap === 'object') {
-              for (const [itemPath, det] of Object.entries(detailsMap)) {
-                if (det && typeof det === 'object' && typeof (det as any).title === 'string') {
-                  storeDetailInCaches(itemPath, det as MovieDetailData, detailTtl);
-                }
-              }
-            }
-          } catch {
-            // ignore single shard read error
-          }
-        }
+        // Do not preload static details from static-db.json or db-shards so /api/details always resolves fresh live <video> streams (1080p/720p/480p) that support OS PiP and Quality switching.
       }
     } catch {
       // ignore preload errors
@@ -1665,8 +1634,23 @@ async function startServer() {
                       parseMovieDetail(r.html, rawPath, r.finalOrigin)
                     );
                 if (primaryDetail.episodes.length > 0) {
-                  // Replace embed sources with 100% ad-free direct video streams from primary mirror!
-                  detail.episodes = primaryDetail.episodes;
+                  // Put direct <video> streams first so OS PiP, Auto Landscape, and Quality Selection work natively!
+                  if (detail.episodes.length > 0) {
+                    detail.episodes = detail.episodes.map((mfEp, idx) => {
+                      const matchedPrimaryEp =
+                        primaryDetail.episodes.find((pe) => pe.number === mfEp.number) ||
+                        primaryDetail.episodes[idx];
+                      return {
+                        ...mfEp,
+                        sources: [
+                          ...(matchedPrimaryEp?.sources || []),
+                          ...mfEp.sources,
+                        ],
+                      };
+                    });
+                  } else {
+                    detail.episodes = primaryDetail.episodes;
+                  }
                   detail.downloadButtons = [
                     ...primaryDetail.downloadButtons,
                     ...detail.downloadButtons,
@@ -1727,29 +1711,37 @@ async function startServer() {
 
       let detail = parseMovieDetail(html, rawPath, finalOrigin);
 
-      // Only fallback to MyFlixBD if primary mirror had 0 episodes (so direct ad-free streams start immediately with zero extra wait!)
-      if (detail.episodes.length === 0) {
-        try {
-          const effectiveQuery = extractBaseSeriesTitle(fallbackTitle || detail.title)
-            .split(/\s+/)
-            .slice(0, 4)
-            .join(' ');
-          const mfSearchHtml =
-            effectiveQuery.length >= 3
-              ? await fetchMyFlixHtml(`/?s=${encodeURIComponent(effectiveQuery)}`, 2800)
-              : '';
-          if (mfSearchHtml) {
-            const mfCards = parseMyFlixCards(mfSearchHtml).items;
-            if (mfCards.length > 0) {
-              const wantBase = extractBaseSeriesTitle(fallbackTitle || detail.title).toLowerCase();
-              const matchedCard =
-                mfCards.find((c) => extractBaseSeriesTitle(c.title).toLowerCase() === wantBase) ||
-                mfCards[0];
-              if (matchedCard) {
-                const mfRealPath = matchedCard.path.replace(/^\/mf\//, '/');
-                const mfDetailHtml = await fetchMyFlixHtml(`${mfRealPath}/`, 3200);
-                const mfDetail = parseMyFlixDetail(mfDetailHtml, rawPath);
-                if (mfDetail.episodes.length > 0) {
+      // Always check MyFlixBD to attach MyFlix Turbo embed servers as Default Server #1 when available!
+      try {
+        const effectiveQuery = extractBaseSeriesTitle(fallbackTitle || detail.title)
+          .split(/\s+/)
+          .slice(0, 4)
+          .join(' ');
+        const mfSearchHtml =
+          effectiveQuery.length >= 2
+            ? await fetchMyFlixHtml(`/?s=${encodeURIComponent(effectiveQuery)}`, 2800)
+            : '';
+        if (mfSearchHtml) {
+          const mfCards = parseMyFlixCards(mfSearchHtml).items;
+          if (mfCards.length > 0) {
+            const norm = (s: string) => extractBaseSeriesTitle(s).toLowerCase().replace(/[^a-z0-9]+/g, '');
+            const wantNorm = norm(fallbackTitle || detail.title);
+            const matchedCard = mfCards.find((c) => {
+              const cNorm = norm(c.title);
+              return (
+                cNorm &&
+                wantNorm &&
+                (cNorm === wantNorm ||
+                  (cNorm.length >= 4 && wantNorm.includes(cNorm)) ||
+                  (wantNorm.length >= 4 && cNorm.includes(wantNorm)))
+              );
+            });
+            if (matchedCard) {
+              const mfRealPath = matchedCard.path.replace(/^\/mf\//, '/');
+              const mfDetailHtml = await fetchMyFlixHtml(`${mfRealPath}/`, 3200);
+              const mfDetail = parseMyFlixDetail(mfDetailHtml, rawPath);
+              if (mfDetail.episodes.length > 0) {
+                if (detail.episodes.length === 0) {
                   detail = {
                     ...detail,
                     episodes: mfDetail.episodes,
@@ -1758,22 +1750,31 @@ async function startServer() {
                         ? detail.downloadButtons
                         : mfDetail.downloadButtons,
                   };
+                } else {
+                  detail.episodes = detail.episodes.map((ep, idx) => {
+                    const matchedMfEp =
+                      mfDetail.episodes.find((me) => me.number === ep.number) ||
+                      mfDetail.episodes[idx] ||
+                      mfDetail.episodes[0];
+                    const mfSources = matchedMfEp?.sources || [];
+                    return {
+                      ...ep,
+                      sources: [...ep.sources, ...mfSources],
+                    };
+                  });
                 }
               }
             }
           }
-        } catch {
-          // ignore MyFlix fallback error
         }
+      } catch {
+        // ignore MyFlix enrichment error
       }
 
       detail = attachFastRelatedSeasons(detail);
 
       if (detail.episodes.length > 0 || detail.downloadButtons.length > 0 || detail.storyline) {
-        detailCache.set(rawPath, {
-          data: detail,
-          expiresAt: Date.now() + 30 * 60_000,
-        });
+        storeDetailInCaches(rawPath, detail, Date.now() + 25 * 60_000);
       }
 
       res.json({ ok: true, detail });
@@ -2274,34 +2275,49 @@ async function startServer() {
     }
 
     try {
-      const searchUrl = `https://myflixbd.to/wp-json/wp/v2/search?search=${encodeURIComponent(cleanQuery)}&per_page=4`;
-      const sRes = await fetch(searchUrl, {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
-        },
-        signal: AbortSignal.timeout(4500),
-      });
-      if (!sRes.ok) {
-        res.json({ ok: false });
-        return;
+      const baseTitle = extractBaseSeriesTitle(rawTitle);
+      const shortWords = baseTitle.split(/\s+/).filter(Boolean).slice(0, 3).join(' ');
+      const queriesToTry = Array.from(new Set([cleanQuery, baseTitle, shortWords].filter((q) => q.length >= 2)));
+
+      let matchedUrl = '';
+      const norm = (s: string) => extractBaseSeriesTitle(s).toLowerCase().replace(/[^a-z0-9]+/g, '');
+      const targetNorm = norm(rawTitle) || cleanQuery.toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+      for (const q of queriesToTry) {
+        const searchUrl = `https://myflixbd.to/wp-json/wp/v2/search?search=${encodeURIComponent(q)}&per_page=6`;
+        const sRes = await fetch(searchUrl, {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
+          },
+          signal: AbortSignal.timeout(4000),
+        }).catch(() => null);
+        if (!sRes || !sRes.ok) continue;
+        const results = (await sRes.json().catch(() => [])) as Array<{ title?: string; url?: string }>;
+        if (!Array.isArray(results) || results.length === 0) continue;
+
+        const exactOrClose = results.find((r) => {
+          const rNorm = norm(String(r.title || ''));
+          return (
+            rNorm &&
+            targetNorm &&
+            (rNorm === targetNorm ||
+              (rNorm.length >= 4 && targetNorm.includes(rNorm)) ||
+              (targetNorm.length >= 4 && rNorm.includes(targetNorm)))
+          );
+        });
+        if (exactOrClose?.url) {
+          matchedUrl = exactOrClose.url;
+          break;
+        }
       }
-      const results = (await sRes.json()) as Array<{ title?: string; url?: string }>;
-      if (!Array.isArray(results) || results.length === 0) {
+
+      if (!matchedUrl) {
         res.json({ ok: false });
         return;
       }
 
-      const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '');
-      const targetNorm = norm(cleanQuery);
-      const matched =
-        results.find((r) => norm(String(r.title || '')).includes(targetNorm)) || results[0];
-      if (!matched?.url) {
-        res.json({ ok: false });
-        return;
-      }
-
-      const pageRes = await fetch(matched.url, {
+      const pageRes = await fetch(matchedUrl, {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
@@ -2320,14 +2336,14 @@ async function startServer() {
         const u = m[1].trim();
         if (u && !seenUrls.has(u)) {
           seenUrls.add(u);
-          embedServers.push({ label: `Server ${embedServers.length + 1}`, url: u });
+          embedServers.push({ label: `MyFlix Server ${embedServers.length + 1}`, url: u });
         }
       }
-      for (const m of html.matchAll(/data-litespeed-src=["'](https?:\/\/player\.[^"']+)["']/gi)) {
+      for (const m of html.matchAll(/(?:data-litespeed-src|src)=["'](https?:\/\/(?:player\.|abysscdn\.com|abyssplayer\.com)[^"']+)["']/gi)) {
         const u = m[1].trim();
         if (u && !seenUrls.has(u)) {
           seenUrls.add(u);
-          embedServers.push({ label: `Server ${embedServers.length + 1}`, url: u });
+          embedServers.push({ label: `MyFlix Server ${embedServers.length + 1}`, url: u });
         }
       }
 
