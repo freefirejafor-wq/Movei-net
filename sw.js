@@ -1,1 +1,25 @@
-if(!self.define){let e,s={};const i=(i,n)=>(i=new URL(i+".js",n).href,s[i]||new Promise(s=>{if("document"in self){const e=document.createElement("script");e.src=i,e.onload=s,document.head.appendChild(e)}else e=i,importScripts(i),s()}).then(()=>{let e=s[i];if(!e)throw new Error(`Module ${i} didn’t register its module`);return e}));self.define=(n,a)=>{const r=e||("document"in self?document.currentScript.src:"")||location.href;if(s[r])return;let o={};const c=e=>i(e,r),t={module:{uri:r},exports:o,require:c};s[r]=Promise.all(n.map(e=>t[e]||c(e))).then(e=>(a(...e),o))}}define(["./workbox-835c8c05"],function(e){"use strict";importScripts("sw-push.js"),self.skipWaiting(),e.clientsClaim(),e.precacheAndRoute([{url:"sw-push.js",revision:"04ba5ff610c06a693706b581d6cf656b"},{url:"registerSW.js",revision:"402b66900e731ca748771b6fc5e7a068"},{url:"pwa-maskable-512x512.png",revision:"c914e04c91fe095c671f30f80182991a"},{url:"pwa-512x512.png",revision:"ba59f9358a6015fe146370a2e29eff3b"},{url:"pwa-192x192.png",revision:"d65e4b2fa951babd79079005790a321b"},{url:"index.html",revision:"cbe2323409a79a4893ce21ffb3a3a21a"},{url:"icon.svg",revision:"2eab63db193c443e909a397881d54072"},{url:"apple-touch-icon.png",revision:"c67ab2743605f62d485dc03e9fb15fe2"},{url:"404.html",revision:"63b44b5a78091247a6b8dc0e508db237"},{url:"assets/index-DsXhxi_f.js",revision:null},{url:"assets/index-BoJUYUDs.css",revision:null},{url:"apple-touch-icon.png",revision:"c67ab2743605f62d485dc03e9fb15fe2"},{url:"icon.svg",revision:"2eab63db193c443e909a397881d54072"},{url:"pwa-192x192.png",revision:"d65e4b2fa951babd79079005790a321b"},{url:"pwa-512x512.png",revision:"ba59f9358a6015fe146370a2e29eff3b"},{url:"pwa-maskable-512x512.png",revision:"c914e04c91fe095c671f30f80182991a"},{url:"sw-push.js",revision:"04ba5ff610c06a693706b581d6cf656b"},{url:"manifest.webmanifest",revision:"6452e9de5b2945c293ce4359fddb6559"}],{}),e.cleanupOutdatedCaches(),e.registerRoute(new e.NavigationRoute(e.createHandlerBoundToURL("index.html"),{denylist:[/^\/api\//,/static-db\.json$/]})),e.registerRoute(/^https:\/\/fonts\.googleapis\.com\/.*/i,new e.CacheFirst({cacheName:"google-fonts-cache",plugins:[new e.ExpirationPlugin({maxEntries:10,maxAgeSeconds:31536e3}),new e.CacheableResponsePlugin({statuses:[0,200]})]}),"GET"),e.registerRoute(/^https:\/\/fonts\.gstatic\.com\/.*/i,new e.CacheFirst({cacheName:"gstatic-fonts-cache",plugins:[new e.ExpirationPlugin({maxEntries:10,maxAgeSeconds:31536e3}),new e.CacheableResponsePlugin({statuses:[0,200]})]}),"GET")});
+
+self.addEventListener('install', (e) => {
+  self.skipWaiting();
+});
+self.addEventListener('activate', (e) => {
+  self.registration.unregister()
+    .then(() => self.clients.matchAll())
+    .then((clients) => {
+      clients.forEach((client) => {
+        if (client instanceof WindowClient)
+          client.navigate(client.url);
+      });
+      return Promise.resolve();
+    })
+    .then(() => {
+      self.caches.keys().then((cacheNames) => {
+        Promise.all(
+          cacheNames.map((cacheName) => {
+            return self.caches.delete(cacheName);
+          }),
+        );
+      })
+    });
+});
+    
