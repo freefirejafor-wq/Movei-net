@@ -65,15 +65,15 @@ interface CacheEntry<T> {
 
 const catalogCache = new Map<string, CacheEntry<{ items: MovieCardItem[]; maxPage: number; activeNodeId: string }>>();
 const detailCache = new Map<string, CacheEntry<MovieDetailData>>();
-const detailTitleCache = new Map<string, MovieDetailData>();
+const detailTitleCache = new Map<string, CacheEntry<MovieDetailData>>();
 let healthCache: CacheEntry<ServerNodeStatus[]> | null = null;
 
 function sortSourcesFastestFirst(sources?: StreamSource[]): StreamSource[] {
   if (!Array.isArray(sources) || sources.length <= 1) return sources || [];
   const score = (src: StreamSource) => {
     const isMyFlixEmbed =
-      src.type === 'embed' || /abyssplayer\.com|myflix/i.test(`${src.url || ''} ${src.id || ''}`);
-    if (isMyFlixEmbed) return 5000;
+      src.type === 'embed' || /abyssplayer\.com|abysscdn\.com|myflix/i.test(`${src.url || ''} ${src.id || ''}`);
+    if (isMyFlixEmbed) return 100;
     const isHevc = /\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${src.name} ${src.qualityLabel}`);
     const isBestHeavy = /best\s*quality/i.test(src.qualityLabel || '');
     let s = isHevc ? 200 : 1000;
@@ -89,6 +89,8 @@ function sortSourcesFastestFirst(sources?: StreamSource[]): StreamSource[] {
 
 function storeDetailInCaches(itemPath: string, det: MovieDetailData, expiresAt: number): void {
   if (!det || typeof det !== 'object') return;
+  // Cap stream token cache at 12 minutes so signed fsldownload stream URLs never expire into HTTP 410 Gone
+  const safeExpiresAt = Math.min(expiresAt, Date.now() + 12 * 60_000);
   if (Array.isArray(det.episodes)) {
     for (const ep of det.episodes) {
       if (Array.isArray(ep.sources)) {
@@ -97,13 +99,13 @@ function storeDetailInCaches(itemPath: string, det: MovieDetailData, expiresAt: 
     }
   }
   if (itemPath) {
-    detailCache.set(itemPath, { data: det, expiresAt });
+    detailCache.set(itemPath, { data: det, expiresAt: safeExpiresAt });
   }
   if (det.title && det.episodes?.length) {
     const canon = getCanonicalTitleKey(det.title);
-    if (canon) detailTitleCache.set(canon, det);
+    if (canon) detailTitleCache.set(canon, { data: det, expiresAt: safeExpiresAt });
     const base = extractBaseSeriesTitle(det.title).toLowerCase();
-    if (base) detailTitleCache.set(base, det);
+    if (base) detailTitleCache.set(base, { data: det, expiresAt: safeExpiresAt });
   }
 }
 
@@ -118,10 +120,10 @@ function findCachedDetailByPathOrTitle(itemPath: string, rawTitle = ''): MovieDe
   if (rawTitle) {
     const canon = getCanonicalTitleKey(rawTitle);
     const byCanon = canon ? detailTitleCache.get(canon) : undefined;
-    if (byCanon && byCanon.episodes?.length) return byCanon;
+    if (byCanon && byCanon.expiresAt > now && byCanon.data?.episodes?.length) return byCanon.data;
     const base = extractBaseSeriesTitle(rawTitle).toLowerCase();
     const byBase = base ? detailTitleCache.get(base) : undefined;
-    if (byBase && byBase.episodes?.length) return byBase;
+    if (byBase && byBase.expiresAt > now && byBase.data?.episodes?.length) return byBase.data;
   }
   return null;
 }
@@ -2560,6 +2562,43 @@ async function startServer() {
     res.status(204).end();
   });
 
+  // Never serve expired static db-shards (HTTP 410 Gone URLs) — force clients to use live /api/details
+  app.get('/db-shards/:file', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.json({ details: {} });
+  });
+
+  // Self-healing Service Worker endpoint: immediately wipes any stale Workbox precaches on Render and reloads clients
+  app.get(['/sw.js', '/dev-sw.js'], (_req, res) => {
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.send(`
+      self.addEventListener('install', () => {
+        self.skipWaiting();
+      });
+      self.addEventListener('activate', (event) => {
+        event.waitUntil(
+          (async () => {
+            try {
+              const keys = await caches.keys();
+              await Promise.all(keys.map((k) => caches.delete(k)));
+            } catch (_) {}
+            try {
+              await self.registration.unregister();
+            } catch (_) {}
+            try {
+              await self.clients.claim();
+              const windowClients = await self.clients.matchAll({ type: 'window' });
+              for (const client of windowClients) {
+                client.navigate(client.url);
+              }
+            } catch (_) {}
+          })()
+        );
+      });
+    `);
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false },
@@ -2568,8 +2607,25 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath, { maxAge: '1h' }));
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          if (
+            filePath.endsWith('.html') ||
+            filePath.endsWith('.json') ||
+            filePath.endsWith('.webmanifest') ||
+            filePath.endsWith('sw.js') ||
+            filePath.endsWith('registerSW.js')
+          ) {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+          } else {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

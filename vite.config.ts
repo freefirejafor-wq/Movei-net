@@ -12,6 +12,7 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
+        selfDestroying: true,
         includeAssets: ['apple-touch-icon.png', 'icon.svg', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png', 'sw-push.js'],
         manifest: {
           name: 'CinePulse HD — iPhone Cinema & Anime Portal',
@@ -44,9 +45,13 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          skipWaiting: true,
+          clientsClaim: true,
+          cleanupOutdatedCaches: true,
           importScripts: ['sw-push.js'],
           maximumFileSizeToCacheInBytes: 15 * 1024 * 1024,
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          globPatterns: [],
+          navigateFallback: null,
           navigateFallbackDenylist: [/^\/api\//, /static-db\.json$/],
           runtimeCaching: [
             {

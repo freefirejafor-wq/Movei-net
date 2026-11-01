@@ -165,14 +165,9 @@ function detectIdealQualityForNetwork(): { targetQuality: number; netLabel: stri
  */
 function pickBestSourceIndexForNet(sources: StreamSource[], autoNet: boolean): number {
   if (!sources || sources.length === 0) return 0;
-  // Always prioritize MyFlix / AbyssPlayer embed server first as default
-  const mfIdx = sources.findIndex(
-    (s) => s.type === 'embed' || /abyssplayer\.com|myflix|\/embed\//i.test(s.url || '')
-  );
-  if (mfIdx !== -1) return mfIdx;
 
   const isDirectStream = (s: StreamSource) =>
-    s.type !== 'embed' && !/abyssplayer\.com|vidsrc|\/embed\//i.test(s.url || '');
+    s.type !== 'embed' && !/abyssplayer\.com|abysscdn\.com|vidsrc|\/embed\//i.test(s.url || '');
   const isLightweightH264 = (s: StreamSource) =>
     isDirectStream(s) &&
     !/\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${s.name} ${s.qualityLabel}`) &&
@@ -792,12 +787,10 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         savedProgress?.episodeIdx !== undefined && eps[savedProgress.episodeIdx]
           ? savedProgress.episodeIdx
           : 0;
-      const firstEp = eps[initEpIdx];
-      const bestSrcIdx = pickBestSourceIndexForNet(firstEp?.sources || [], autoNetQuality);
       if (!isAlreadyMountedInstant) {
         setDetail(resolved);
         setSelectedEpIdx(initEpIdx);
-        setSelectedSourceIdx(bestSrcIdx);
+        setSelectedSourceIdx(0);
       }
     };
 
@@ -937,14 +930,6 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       .then((res) => {
         if (!cancelled && res && res.ok) {
           setMyflixData(res);
-          if (
-            !hasUserManualServerRef.current &&
-            !hasStartedPlayback &&
-            ((res.embedServers && res.embedServers.length > 0) ||
-              (res.seasonsData && res.seasonsData.length > 0))
-          ) {
-            setSelectedSourceIdx(0);
-          }
         }
       })
       .catch(() => {});
@@ -2091,16 +2076,31 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       return;
     }
 
-    // Only attempt client-side MP4 remux bridge ONCE per episode if native playback failed
-    if (!useHlsBridge && !hasTriedBridgeFallbackRef.current) {
+    // If all cached sources failed once, request a fresh live stream token via enrich=1 (without looping old sources)
+    if (!hasTriedBridgeFallbackRef.current && movie) {
       hasTriedBridgeFallbackRef.current = true;
-      if (resumeAt > 3) {
-        pendingResumeSecRef.current = resumeAt;
-      }
-      setUseHlsBridge(true);
-      setFailedSourceIndices([]);
-      setSelectedSourceIdx(pickBestSourceIndexForNet(sources, true));
-      setVideoError(false);
+      const params = new URLSearchParams({
+        path: movie.path || movie.url,
+        title: movie.title,
+        node: activeNodeId,
+        enrich: '1',
+      });
+      universalApiFetch(`/api/details?${params.toString()}`)
+        .then((data) => {
+          if (data?.ok && data?.detail?.episodes?.length) {
+            setDetail(data.detail);
+            setFailedSourceIndices([]);
+            setSelectedSourceIdx(0);
+            setVideoError(false);
+          } else {
+            setIsBuffering(false);
+            setVideoError(true);
+          }
+        })
+        .catch(() => {
+          setIsBuffering(false);
+          setVideoError(true);
+        });
       return;
     }
 

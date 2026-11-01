@@ -140,37 +140,12 @@ function indexDetailsIntoMemory(detailsMap?: Record<string, MovieDetailData>, is
   }
 }
 
-async function loadShardByHex(hex: string): Promise<void> {
-  if (!hex || loadedShards.has(hex)) return;
-  const existing = inFlightShards.get(hex);
-  if (existing) return existing;
-  const p = (async () => {
-    try {
-      const res = await fetch(`./db-shards/shard-${hex}.json`);
-      if (!res.ok) return;
-      const parsed = await res.json();
-      loadedShards.add(hex);
-      if (parsed?.details) {
-        indexDetailsIntoMemory(parsed.details);
-      }
-    } catch {
-      // ignore
-    } finally {
-      inFlightShards.delete(hex);
-    }
-  })();
-  inFlightShards.set(hex, p);
-  return p;
+async function loadShardByHex(_hex: string): Promise<void> {
+  // Static shards contain time-limited stream URLs that expire; always resolve streams live via /api/details
+  return;
 }
 
 export async function loadShardForMovie(rawPath: string, rawTitle: string): Promise<MovieDetailData | null> {
-  const k1 = normalizeLookupTitleKey(rawTitle);
-  const kLegacy = legacyNormalizeLookupTitleKey(rawTitle);
-  const hexes = new Set<string>();
-  if (k1) hexes.add(computeShardHex(k1));
-  if (kLegacy) hexes.add(computeShardHex(kLegacy));
-  if (rawPath) hexes.add(computeShardHex(rawPath));
-  await Promise.all(Array.from(hexes).map((h) => loadShardByHex(h)));
   return getInstantCachedDetail(rawPath, rawTitle);
 }
 
@@ -433,36 +408,11 @@ export function getInstantCachedDetail(rawPath: string, rawTitle = ''): MovieDet
   if (!pathKey && !rawTitle) return null;
 
   const mem = clientDetailCache.get(pathKey);
-  if (mem && mem.detail?.episodes?.length) {
+  // Only use in-memory detail cache if fetched within the last 12 minutes so stream tokens never expire
+  if (mem && Date.now() - mem.ts < 12 * 60_000 && mem.detail?.episodes?.length) {
     return mem.detail;
   }
 
-  if (loadedStaticDb?.details) {
-    if (pathKey && loadedStaticDb.details[pathKey]?.episodes?.length) {
-      return loadedStaticDb.details[pathKey];
-    }
-    const strippedPath = pathKey.replace(/-\d+$/, '');
-    if (strippedPath && loadedStaticDb.details[strippedPath]?.episodes?.length) {
-      return loadedStaticDb.details[strippedPath];
-    }
-    if (rawTitle) {
-      const k1 = normalizeLookupTitleKey(rawTitle);
-      const k2 = rawTitle.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const indexed = (k2 && staticDbTitleIndex.get(k2)) || (k1 && staticDbTitleIndex.get(k1));
-      if (indexed && indexed.episodes?.length) {
-        return indexed;
-      }
-      const cleanWant = extractBaseSeriesTitle(rawTitle).toLowerCase();
-      const found = Object.values(loadedStaticDb.details).find((d) => {
-        const dClean = extractBaseSeriesTitle(d.title).toLowerCase();
-        return d.title === rawTitle || (cleanWant.length >= 4 && dClean === cleanWant);
-      });
-      if (found && found.episodes?.length) {
-        if (k2) staticDbTitleIndex.set(k2, found);
-        return found;
-      }
-    }
-  }
   return null;
 }
 
@@ -1331,24 +1281,7 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
       return { ok: true, detail: attachRelatedSeasons(cachedDetail.detail) };
     }
 
-    // 2. Check pre-decrypted staticDb snapshot by path OR by matching title (unless live enrich is requested)!
-    if (!isLiveEnrich && staticDb?.details) {
-      if (rawPath && staticDb.details[rawPath]?.episodes?.length) {
-        return { ok: true, detail: attachRelatedSeasons(staticDb.details[rawPath]) };
-      }
-      if (rawTitle) {
-        const cleanWant = extractBaseSeriesTitle(rawTitle).toLowerCase();
-        const foundByTitle = Object.values(staticDb.details).find((d) => {
-          const dClean = extractBaseSeriesTitle(d.title).toLowerCase();
-          return d.title === rawTitle || (cleanWant.length >= 4 && dClean === cleanWant);
-        });
-        if (foundByTitle && foundByTitle.episodes.length > 0) {
-          return { ok: true, detail: attachRelatedSeasons(foundByTitle) };
-        }
-      }
-    }
-
-    // 3. Live fetch & cipher decrypt in browser (with cache-busting when isLiveEnrich is true)
+    // 2. Live fetch & cipher decrypt in browser (with cache-busting when isLiveEnrich is true)
     try {
       let { html, finalOrigin } = await fetchMirrorHtmlClientSide(
         rawPath || '/',
